@@ -1,0 +1,9 @@
+# Optional extras. Install separately so a failure here can't block the core install.
+# Tray icon + audio file picker menu
+pystray
+Pillow
+# Audio file import (mp3/ogg/flac/wav)
+soundfile
+scipy
+# Speaker labels in call transcripts (large: pulls in PyTorch)
+diarize

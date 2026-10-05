@@ -1494,10 +1494,30 @@ class App:
         self.ui("quit")
 
 
+def check_dependencies() -> None:
+    """Log exactly which packages are missing, and which Python is running."""
+    import importlib.util
+
+    groups = [
+        ("REQUIRED", [("moondream", "moondream"), ("numpy", "numpy"),
+                      ("sounddevice", "sounddevice"), ("pynput", "pynput"),
+                      ("pyperclip", "pyperclip")]),
+        ("optional (tray icon + file picker)", [("pystray", "pystray"), ("PIL", "Pillow")]),
+        ("optional (audio file import)", [("soundfile", "soundfile"), ("scipy", "scipy")]),
+        ("optional (speaker labels)", [("diarize", "diarize")]),
+    ]
+    for label, mods in groups:
+        missing = [pkg for mod, pkg in mods if importlib.util.find_spec(mod) is None]
+        if missing:
+            log.warning("Missing %s: %s  ->  %s -m pip install %s", label,
+                        ", ".join(missing), sys.executable, " ".join(missing))
+
+
 def main() -> None:
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))
-    log.info("PyKeet starting (python %s)", sys.version.split()[0])
+    log.info("PyKeet starting (python %s at %s)", sys.version.split()[0], sys.executable)
+    check_dependencies()
     try:
         import tkinter  # noqa: F401
     except ImportError:
