@@ -77,6 +77,10 @@ cleanup = true            # strip um/uh, collapse repeats, apply replacements
 insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
 dictation_beep = false
 
+# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
+# false = use the basic built-in dialog.
+native_file_picker = true
+
 # --- Calls -----------------------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
@@ -103,6 +107,7 @@ DEFAULTS = {
     "cancel_shortcut": "esc",
     "call_shortcut": "ctrl+alt+r",
     "import_shortcut": "ctrl+alt+o",
+    "native_file_picker": True,
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
     "call_model": "",
@@ -399,16 +404,22 @@ AUDIO_TYPES = [("Audio files", "*.mp3 *.ogg *.flac *.wav"), ("All files", "*.*")
 
 def decode_to_wav(src: Path, dest: Path) -> float:
     """Decode mp3/ogg/flac/wav to 16 kHz mono 16-bit WAV. Returns duration in s."""
-    import soundfile as sf
-    from math import gcd
-
-    from scipy.signal import resample_poly
+    import soundfile as sf  # ImportError here means the package is not installed
 
     data, rate = sf.read(str(src), dtype="float32", always_2d=True)
     mono = data.mean(axis=1)
     if rate != SAMPLE_RATE:
-        g = gcd(SAMPLE_RATE, int(rate))
-        mono = resample_poly(mono, SAMPLE_RATE // g, int(rate) // g).astype("float32")
+        try:
+            from math import gcd
+
+            from scipy.signal import resample_poly
+
+            g = gcd(SAMPLE_RATE, int(rate))
+            mono = resample_poly(mono, SAMPLE_RATE // g, int(rate) // g).astype("float32")
+        except ImportError:  # scipy missing: plain linear resampling is fine for speech
+            n = int(len(mono) * SAMPLE_RATE / rate)
+            mono = np.interp(np.linspace(0, len(mono) - 1, n), np.arange(len(mono)),
+                             mono).astype("float32")
     w = WavWriter(dest)
     try:
         for i in range(0, len(mono), SAMPLE_RATE * 60):
@@ -587,6 +598,23 @@ def open_path(path) -> None:
             subprocess.Popen(["xdg-open", path])
     except Exception:
         log.exception("could not open %s", path)
+
+
+def native_picker_command() -> list[str] | None:
+    """Command for the desktop's own multi-file audio picker (Linux), or None."""
+    exts = ["mp3", "ogg", "flac", "wav"]
+    home = os.path.expanduser("~") + os.sep
+    if sys.platform.startswith("linux"):
+        if shutil.which("zenity"):  # GNOME / GTK: has the normal sidebar
+            pats = [f"*.{e}" for e in exts] + [f"*.{e.upper()}" for e in exts]
+            return ["zenity", "--file-selection", "--multiple", "--separator=\n",
+                    "--title=Choose audio files to transcribe", f"--filename={home}",
+                    "--file-filter=Audio files | " + " ".join(pats),
+                    "--file-filter=All files | *"]
+        if shutil.which("kdialog"):  # KDE
+            return ["kdialog", "--multiple", "--separate-output", "--getopenfilename", home,
+                    " ".join(f"*.{e}" for e in exts) + "|Audio files"]
+    return None
 
 
 def insert_text(text: str, method: str) -> None:
@@ -1354,11 +1382,31 @@ class App:
             self.ui("hidden")
 
     # -- audio file import ----------------------------------------------------------
+    def show_text(self, title: str, body: str, path=None) -> None:
+        if self.widget:
+            self.widget.q.put(("text", title, body, path))
+
     def request_file_picker(self) -> None:
-        if self.ready and self.mode == "idle" and self.widget:
-            self.widget.send("pick_file")  # the dialog must open on the tkinter thread
-        else:
+        if not (self.ready and self.mode == "idle" and self.widget):
             self.notify("PyKeet", "Busy or still loading. Try again in a moment.")
+            return
+        cmd = native_picker_command() if self.cfg["native_file_picker"] else None
+        if cmd:  # the desktop's own dialog (sidebar, bookmarks, recent files)
+            threading.Thread(target=self._native_pick, args=(cmd,), daemon=True).start()
+        else:
+            self.widget.send("pick_file")  # fallback: tkinter dialog on the tkinter thread
+
+    def _native_pick(self, cmd) -> None:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception:
+            log.exception("system file picker failed; using the built-in one")
+            if self.widget:
+                self.widget.send("pick_file")
+            return
+        paths = [p for p in out.stdout.splitlines() if p.strip()]
+        if paths:
+            self.post(lambda: self.import_files(paths))
 
     def import_files(self, paths) -> None:
         with self.lock:
@@ -1376,10 +1424,16 @@ class App:
                 try:
                     self.ui("call_transcribing")
                     duration = decode_to_wav(src, wav)
-                except Exception:
+                except Exception as exc:
                     log.exception("could not read audio file %s", src.name)
                     wav.unlink(missing_ok=True)
-                    self.notify("PyKeet", f"Could not read {src.name}. Is it a valid audio file?")
+                    if isinstance(exc, ImportError):
+                        why = (f"The package '{exc.name}' is not installed.\n\nRun this in the "
+                               f"terminal you start PyKeet from:\n{sys.executable} -m pip install "
+                               f"soundfile")
+                    else:
+                        why = f"{type(exc).__name__}: {exc}"
+                    self.show_text(f"Could not read {src.name}", why)
                     continue
                 if duration < 1:
                     wav.unlink(missing_ok=True)

@@ -75,13 +75,15 @@ first time you record a call).
 
 ## Transcribing an audio file
 
-Tray menu > **Transcribe audio file…** (or `Ctrl+Alt+O`, handy if your desktop has no tray) opens a file picker for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
+Tray menu > **Transcribe audio file…** (or `Ctrl+Alt+O`, handy if your desktop has no tray) opens your desktop's own file dialog (via `zenity` on GNOME, `kdialog` on KDE, so you get your usual sidebar
+and bookmarks; on Fedora `sudo dnf install zenity` if it is missing; set `native_file_picker = false` to use the
+basic built-in dialog) for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
 several to batch them). Each file is decoded to 16 kHz mono, transcribed with the call settings
 (speaker labelling included, same fallbacks), and saved in your transcript folder as
 `YYYY-MM-DD_HHMM_<filename>.md`. When it finishes, a **text window** shows the transcript with
 **Copy all** and **Open file** buttons. Your original file is never modified or deleted. It is
-unavailable while a recording or another job is running. MP3 needs `soundfile` 0.12+ (included in
-`requirements.txt`).
+unavailable while a recording or another job is running. Needs `soundfile` (in `requirements-optional.txt`); if a
+file can't be read, a window shows the exact reason.
 
 ## Call transcripts
 
