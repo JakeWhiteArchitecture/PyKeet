@@ -138,6 +138,14 @@ file can't be read, a window shows the exact reason.
   Hugging Face (after that it works offline), and the package would send anonymous usage pings by
   default, which PyKeet switches off (`NEEDLE_TELEMETRY=0`). It is built for phone-style tool calls, so
   test it on a real transcript before trusting it.
+**Teach it with example phrases.** `action_backend = "phrases"` compares each sentence with the example
+  phrases in `action_phrases.toml` (created on first use with about a dozen per type plus a "none" group of
+  ordinary chat; edit it freely and add phrases from your own meetings). With no install it matches by
+  word overlap: on my 50-sentence check it lifted messy speech from 4/14 to 8/14 when combined with the
+  rules, with one more false hit, so it is a modest help. `action_backend = "needle-phrases"` compares the
+  same phrases by *meaning* using Needle 3's embeddings (so "we'll go larch" can match "let's go with
+  that"); that one is untested on real speech. See why a sentence got its label with
+  `python main.py --explain "so yeah I think we'll go larch"`.
 You can also point PyKeet at a model server you run yourself:
   `action_backend = "server"` and `action_server = "http://127.0.0.1:8080"` (llama.cpp's
   `llama-server`, Ollama, LM Studio, or Microsoft's `bitnet.cpp` server for ternary BitNet models

@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from datetime import datetime
@@ -32,10 +33,11 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.1"
+VERSION = "1.2"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
+PHRASES_PATH = HERE / "action_phrases.toml"
 TMP_DIR = HERE / "tmp"  # temporary call WAVs live here
 
 SAMPLE_RATE = 16_000
@@ -82,67 +84,69 @@ cleanup = true            # strip um/uh, collapse repeats, apply replacements
 insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
 dictation_beep = false
 
-# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
-# false = use the basic built-in dialog.
-native_file_picker = true
-
-# --- Calls ---
-# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
-# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
-# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
-# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
-call_workers = 2
-# Dictation only (not calls, meetings or audio files): cut long silent pauses, e.g. when you
-# stop to think, before transcribing. A silence is only cut once speech has clearly resumed, and
-# `dictation_silence_keep_seconds` of quiet either side is kept so the first sound of returning
-# speech is never clipped.
+# Cut long silent pauses (e.g. you stop to think) before transcribing. Dictation only; calls,
+# meetings and audio files are never trimmed. A silence is only cut once speech has clearly
+# resumed, and `dictation_silence_keep_seconds` of quiet either side is kept so the first sound
+# of returning speech is never clipped.
 trim_dictation_silence = true
 dictation_silence_min_seconds = 2.0   # only silences at least this long are shortened
 dictation_silence_keep_seconds = 0.4  # quiet kept before and after the speech
 dictation_silence_threshold_db = 0    # 0 = automatic (adapts to your room noise); or e.g. -45
-# Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
-highlight_names = []
-highlight_companies = []
-# Mark sentences about decisions and tasks in the transcript viewer (underlined in colour):
-# decisions to make, options, decisions made, tasks to do, tasks done. Phrase-matching
-# rules (English), so it is a rough guide, not understanding. Plus an "Action summary" view.
-highlight_actions = true
-# Optional: a small AI model that reads each sentence for its meaning, much better than the
-# phrase rules on natural speech. Empty = rules only. Needs `pip install transformers` (uses the
-# PyTorch you already have) and downloads the model once (~100-300 MB). Try, in order of size:
-#   "MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33"   (tiny)
-#   "typeform/distilbert-base-uncased-mnli"                    (bigger, well known)
-# Analysis runs in the background after the viewer opens; the rules show straight away.
-action_model = ""
-# "zeroshot" = small classifier model (names like ...zeroshot... / ...mnli).
-# "llm" = a small chat/instruct language model that is shown examples and asked to pick a
-#         label, e.g. "Qwen/Qwen2.5-0.5B-Instruct" (~1 GB; better wording understanding than
-#         the classifier but slower: minutes for a long call, run in the background) or
-#         "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB, better, slower still). Models under ~0.5B
-#         (e.g. Gemma 3 270M) are usually too small to be reliable at this.
-action_backend = "zeroshot"
-# "server" = talk to a model you run yourself in a local server that speaks the common
-#            OpenAI-style API (llama.cpp's llama-server, Microsoft's bitnet.cpp for ternary
-#            BitNet models, Ollama, LM Studio...). Set action_server to its address.
-#            PyKeet installs nothing for this; you start the server, PyKeet just asks it.
-action_server = "http://127.0.0.1:8080"
-# "needle" = Cactus Needle 3, a tiny (8-29 MB) tool-calling model that runs on the CPU:
-#            pip install cactus-needle   (action_model is not needed for this one).
-#            Each label is a "tool" and the model picks the right one for each sentence.
-#            First use downloads the model and a small engine library from Hugging Face.
-#            PyKeet switches off its anonymous usage pings (NEEDLE_TELEMETRY=0).
-# Use a small name-recognition model (spaCy) for better names/places/companies in the
-# transcript viewer. Optional install, see README. Falls back to simple rules if missing.
-use_ner = true
-# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
-# install; the other is the fallback.
-ner_model = "en_core_web_md"
---------------------------------------------------------------
+
+# --- Calls and audio files -------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
 keep_audio = false        # keep the call WAV next to the transcript
 label_speakers = true
 expected_speakers = 2     # 0 = detect automatically
+# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
+# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
+# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
+# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
+call_workers = 2
+# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
+# false = use the basic built-in dialog.
+native_file_picker = true
+
+# --- Transcript viewer: names and highlights --------------------------------
+# Always highlight these, e.g. ["Sarah Mitchell"].
+highlight_names = []
+highlight_companies = []
+# Use a small name-recognition model (spaCy) for better names/places/companies. Optional
+# install, see README. Falls back to simple rules if missing.
+use_ner = true
+# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
+# install; the other is the fallback.
+ner_model = "en_core_web_md"
+
+# --- Transcript viewer: decisions and tasks ---------------------------------
+# Underline sentences about decisions to make, options, decisions made, tasks to do and tasks
+# done, and offer an "Action summary" view. The built-in phrase rules are a rough guide only
+# (English). Optionally add an AI helper with action_backend, which decides how it is asked:
+highlight_actions = true
+#   "zeroshot"       small classifier model, needs `pip install transformers`; set action_model, e.g.
+#                    "MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33" (tiny) or
+#                    "typeform/distilbert-base-uncased-mnli" (bigger). Empty action_model = rules only.
+#   "llm"            small chat model run here, e.g. action_model = "Qwen/Qwen2.5-0.5B-Instruct"
+#                    (~1 GB, minutes on a long call) or "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB).
+#                    Models under ~0.5B (e.g. Gemma 3 270M) are usually too small to be reliable.
+#   "server"         a model you run in your own local server with the common OpenAI-style API
+#                    (llama.cpp's llama-server, Ollama, LM Studio, bitnet.cpp for ternary BitNet
+#                    models). Set action_server. PyKeet installs nothing for this.
+#   "needle"         Cactus Needle 3, a tiny (8-29 MB) tool-calling model on the CPU:
+#                    `pip install cactus-needle`. First use downloads the model and a small engine
+#                    library from Hugging Face. PyKeet switches off its anonymous usage pings.
+#   "phrases"        compare each sentence with the example phrases in action_phrases.toml using
+#                    word overlap. No install; improve it by adding your own phrases.
+#   "needle-phrases" the same phrase bank compared by MEANING with Needle 3's embeddings, so
+#                    different wording still matches (`pip install cactus-needle`).
+# Test any of them with:  python main.py --explain "a sentence"
+action_backend = "zeroshot"
+action_model = ""
+action_server = "http://127.0.0.1:8080"
+# How alike a sentence must be to a phrase to count for the two "phrases" backends
+# (0 = automatic: 0.35 for "phrases", 0.55 for "needle-phrases"). Raise it for fewer false hits.
+phrase_min_similarity = 0
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
@@ -176,6 +180,7 @@ DEFAULTS = {
     "action_model": "",
     "action_backend": "zeroshot",
     "action_server": "http://127.0.0.1:8080",
+    "phrase_min_similarity": 0,
     "ner_model": "en_core_web_md",
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
@@ -202,12 +207,19 @@ def load_config() -> dict:
         CONFIG_PATH.write_text(CONFIG_TEMPLATE, encoding="utf-8")
     cfg = dict(DEFAULTS)
     try:
-        data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+        # Versions 0.7-1.1 wrote a stray line of dashes (not a comment) that made the whole
+        # file invalid TOML; drop it so such files still load.
+        text, fixed = re.subn(r"(?m)^-{10,}[ \t]*\n?", "", text)
+        if fixed:
+            print(f"Note: repaired a stray line in {CONFIG_PATH.name}", file=sys.stderr)
+        data = tomllib.loads(text)
         cfg.update(data)
         if data.get("parallel_workers") is False and "call_workers" not in data:
             cfg["call_workers"] = 0  # old setting
-    except Exception:
-        print(f"Could not read {CONFIG_PATH}; using defaults.", file=sys.stderr)
+    except Exception as exc:
+        print(f"Could not read {CONFIG_PATH}: {exc}\nUsing default settings; fix the line named "
+              f"above (or delete the file to start fresh).", file=sys.stderr)
         logging.getLogger("pykeet").exception("config read failed")
         cfg["replacements"] = {}
     return cfg
@@ -814,6 +826,163 @@ class NeedleActionModel:
         return out
 
 
+PHRASE_LABELS = ["decision_open", "option", "decision_made", "task_open", "task_done", "none"]
+DEFAULT_PHRASES: dict[str, list[str]] = {
+    "decision_open": [
+        "we still need to decide which one to go for", "I'm not sure whether we should do it that way",
+        "we haven't decided yet", "which do you prefer", "what do you think we should do about this",
+        "it's up to you, you decide", "we need to make a decision on the windows",
+        "do you want it this way or that way", "we need to choose the finish",
+        "that's still to be decided", "shall we go ahead or wait", "I can't decide between the two"],
+    "option": [
+        "one option is to extend to the rear", "the other option would be to leave it as it is",
+        "we could do it this way or we could do it another way", "alternatively we could change the layout",
+        "option one is cheaper, option two looks better", "there are two ways of doing this",
+        "you could either keep the wall or take it out", "another possibility is a flat roof",
+        "choice a is timber, choice b is aluminium", "on the one hand it costs less, on the other hand it takes longer"],
+    "decision_made": [
+        "right, we've agreed on the brick", "that's decided then", "let's go with that",
+        "we're going ahead with the loft conversion", "we've settled on the second design",
+        "okay, we'll use the cheaper one", "the client has approved the scheme",
+        "we're sticking with the original plan", "I'm happy, let's do it",
+        "we've chosen the grey windows", "agreed, we'll do it that way", "we went with the first option in the end"],
+    "task_open": [
+        "I'll sort that out for you next week", "can you send me the details by tomorrow",
+        "I need to ring the builder about the quote", "we have to submit the application before the deadline",
+        "please remember to update the drawings", "somebody needs to follow that up",
+        "I'll get back to you on that", "he's going to email the engineer", "I'll put it in the diary",
+        "make sure you chase the council", "we need to book a site visit",
+        "can you check the dimensions and let me know"],
+    "task_done": [
+        "I've already emailed the drawings", "that's all been sent off", "we submitted the application last week",
+        "the builder has confirmed the date", "I booked the survey yesterday", "it's all sorted now",
+        "the invoice has been paid", "I finished the report this morning", "they've delivered the materials",
+        "that's done, ticked off the list", "we've got the approval back",
+        "I called the engineer and he's coming Tuesday"],
+    "none": [
+        "it was a lovely day when we visited", "the house has a big garden at the back", "yeah, mm, okay",
+        "the ceiling height is about two and a half metres", "I think the neighbours are quite friendly",
+        "how was your weekend", "sorry, can you say that again",
+        "the previous owner built the extension in the nineties", "it's quite a busy road outside",
+        "right, so that's the front elevation", "thanks very much for your time",
+        "I don't really know much about that"],
+}
+PHRASES_FILE_HEADER = """# Example phrases for each decision / task type, used by action_backend = "phrases" or
+# "needle-phrases". A sentence is given the type of the phrase it is most like. Add phrases from
+# your own meetings (natural speech works best) and delete ones that cause false hits. "none"
+# holds ordinary chat that should NOT count, which helps it tell the difference.
+"""
+
+
+def load_phrases() -> dict[str, list[str]]:
+    """Read action_phrases.toml (written with the defaults on first use)."""
+    if not PHRASES_PATH.exists():
+        lines = [PHRASES_FILE_HEADER]
+        for label in PHRASE_LABELS:
+            lines.append(f"[{label}]\nphrases = [")
+            lines += [f"  {json.dumps(p)}," for p in DEFAULT_PHRASES[label]]
+            lines.append("]\n")
+        try:
+            PHRASES_PATH.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            log.exception("could not write %s", PHRASES_PATH)
+    try:
+        data = tomllib.loads(PHRASES_PATH.read_text(encoding="utf-8"))
+        out = {k: [str(p) for p in data.get(k, {}).get("phrases", []) if str(p).strip()]
+               for k in PHRASE_LABELS}
+        if any(out[k] for k in PHRASE_LABELS if k != "none"):
+            return out
+    except Exception:
+        log.exception("could not read %s; using the built-in phrases", PHRASES_PATH)
+    return {k: list(v) for k, v in DEFAULT_PHRASES.items()}
+
+
+_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+class LexicalEmbedder:
+    """Word and word-pair overlap as a vector (no model): words that appear in many of the
+    bank's phrases count for less, so 'the' and 'we' matter less than 'decided' or 'sent'."""
+
+    DIM = 2048
+
+    def __init__(self, phrases: dict[str, list[str]]):
+        docs = [set(_WORD_RE.findall(p.lower())) for ps in phrases.values() for p in ps]
+        n = max(1, len(docs))
+        df: dict[str, int] = {}
+        for d in docs:
+            for w in d:
+                df[w] = df.get(w, 0) + 1
+        self.idf = {w: math.log(1 + n / c) for w, c in df.items()}
+        self.default_idf = math.log(1 + n)
+
+    def __call__(self, text: str) -> np.ndarray:
+        words = _WORD_RE.findall(text.lower())
+        vec = np.zeros(self.DIM, dtype=np.float32)
+        for i, w in enumerate(words):
+            weight = self.idf.get(w, 0.0)
+            vec[zlib.crc32(w.encode()) % self.DIM] += weight
+            if i + 1 < len(words):
+                vec[zlib.crc32((w + " " + words[i + 1]).encode()) % self.DIM] += 0.7 * weight
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm else vec
+
+
+class NeedleEmbedder:
+    """Meaning-based vectors from Needle 3's embedding head. Optional."""
+
+    def __init__(self):
+        os.environ["NEEDLE_TELEMETRY"] = "0"
+        import needle
+
+        self.agent = needle.Needle(stateless=True, auto_date=False)
+
+    def __call__(self, text: str) -> np.ndarray:
+        vec = np.asarray(self.agent.embed(text), dtype=np.float32)
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm else vec
+
+
+class PhraseActionModel:
+    """Label a sentence by the example phrase it is most like (cosine similarity)."""
+
+    def __init__(self, embed, phrases: dict[str, list[str]], min_sim: float, margin: float = 0.03):
+        self.embed, self.min_sim, self.margin = embed, min_sim, margin
+        self.labels: list[str] = []
+        self.texts: list[str] = []
+        vecs = []
+        for label, plist in phrases.items():
+            for p in plist:
+                self.labels.append(label)
+                self.texts.append(p)
+                vecs.append(embed(p))
+        self.matrix = np.stack(vecs)
+
+    def explain(self, sentence: str) -> list[tuple[str, float, str]]:
+        """Best phrase per label, best first: (label, similarity, phrase)."""
+        sims = self.matrix @ self.embed(sentence)
+        best: dict[str, tuple[float, str]] = {}
+        for label, sim, text in zip(self.labels, sims, self.texts):
+            if label not in best or sim > best[label][0]:
+                best[label] = (float(sim), text)
+        return sorted(((k, v[0], v[1]) for k, v in best.items()), key=lambda r: -r[1])
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        out = []
+        for sent in sentences:
+            ranked = self.explain(sent)
+            (label, sim, _), second = ranked[0], ranked[1][1]
+            if sim < self.min_sim:
+                out.append((None, 0.0))  # not like anything in the bank: leave it to the rules
+                continue
+            gap = sim - second
+            if label == "none":
+                out.append((None, 0.4 + min(0.4, gap * 3)))  # only a clear 'chat' removes a rule hit
+            else:
+                out.append((label, 0.55 + min(0.4, gap * 3) if gap >= self.margin else 0.45))
+        return out
+
+
 class ServerActionModel:
     """Asks a local model server (OpenAI-style /v1/completions) to pick the answer letter.
     Works with any model the server runs, including ternary BitNet models via bitnet.cpp."""
@@ -873,11 +1042,18 @@ def parse_server_letters(choice: dict) -> dict[str, float] | None:
     return {k: items.get(k, -30.0) for k in LLM_LETTERS}
 
 
-def get_action_model(name: str, backend: str = "zeroshot", server: str = ""):
-    key = (name, backend, server)
+def get_action_model(name: str, backend: str = "zeroshot", server: str = "",
+                     min_sim: float = 0.0):
+    key = (name, backend, server, min_sim)
     if key not in _ACTION_MODELS:
         try:
-            if backend == "needle":
+            if backend in ("phrases", "needle-phrases"):
+                phrases = load_phrases()
+                lexical = backend == "phrases"
+                _ACTION_MODELS[key] = PhraseActionModel(
+                    LexicalEmbedder(phrases) if lexical else NeedleEmbedder(), phrases,
+                    float(min_sim) or (0.35 if lexical else 0.55))
+            elif backend == "needle":
                 _ACTION_MODELS[key] = NeedleActionModel()
             elif backend == "server":
                 _ACTION_MODELS[key] = ServerActionModel(server, name)
@@ -1920,7 +2096,7 @@ class Widget:
         model_name = str(self.app.cfg.get("action_model") or "")
         backend = str(self.app.cfg.get("action_backend") or "zeroshot")
         if (markdown and self.app.cfg.get("highlight_actions")
-                and (model_name or backend in ("server", "needle"))):
+                and (model_name or backend in ("server", "needle", "phrases", "needle-phrases"))):
             status.pack(side="bottom", fill="x", padx=10)
             status.configure(text="Analysing decisions and tasks with the AI model "
                                   "(the first time it downloads the model)…")
@@ -1929,7 +2105,8 @@ class Widget:
             def work():
                 try:
                     model = get_action_model(model_name, backend,
-                                             str(self.app.cfg.get("action_server") or ""))
+                                             str(self.app.cfg.get("action_server") or ""),
+                                             float(self.app.cfg.get("phrase_min_similarity") or 0))
                     if model is None:
                         raise RuntimeError("model could not be loaded; see pykeet.log")
                     analyse_actions(body, model)
@@ -2664,7 +2841,31 @@ def check_dependencies() -> None:
                         ", ".join(missing), sys.executable, " ".join(missing))
 
 
+def explain(sentence: str) -> None:
+    """`python main.py --explain "some sentence"`: show how the detector sees a sentence."""
+    cfg = load_config()
+    logging.basicConfig(level=logging.WARNING)
+    print(f"Sentence: {sentence}\nPhrase rules say: {classify_sentence(sentence)}")
+    backend = str(cfg.get("action_backend") or "zeroshot")
+    model = get_action_model(str(cfg.get("action_model") or ""), backend,
+                             str(cfg.get("action_server") or ""),
+                             float(cfg.get("phrase_min_similarity") or 0))
+    if model is None:
+        print(f"Backend '{backend}' is not available (see the warning above): rules only.")
+        return
+    if isinstance(model, PhraseActionModel):
+        print(f"Most similar phrase per type (needs >= {model.min_sim:g} to count):")
+        for label, sim, text in model.explain(sentence):
+            print(f"  {sim:5.2f}  {label:14} {text}")
+    kind, score = model.predict([sentence])[0]
+    print(f"Backend '{backend}' says: {kind} (confidence {score:.2f}); "
+          f"combined with the rules: {combine_kind(classify_sentence(sentence), kind, score)}")
+
+
 def main() -> None:
+    if len(sys.argv) > 2 and sys.argv[1] == "--explain":
+        explain(" ".join(sys.argv[2:]))
+        return
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))
     log.info("PyKeet %s starting (python %s at %s)", VERSION, sys.version.split()[0],
