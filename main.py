@@ -28,6 +28,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
+VERSION = "0.4"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -406,7 +407,23 @@ def decode_to_wav(src: Path, dest: Path) -> float:
     """Decode mp3/ogg/flac/wav to 16 kHz mono 16-bit WAV. Returns duration in s."""
     import soundfile as sf  # ImportError here means the package is not installed
 
-    data, rate = sf.read(str(src), dtype="float32", always_2d=True)
+    try:
+        data, rate = sf.read(str(src), dtype="float32", always_2d=True)
+    except Exception as first:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise
+        log.warning("soundfile could not read %s (%s); trying ffmpeg", src.name, first)
+        tmp = dest.with_suffix(".ff.wav")
+        try:
+            run = subprocess.run([ffmpeg, "-y", "-v", "error", "-i", str(src), "-ac", "1",
+                                  "-ar", str(SAMPLE_RATE), str(tmp)],
+                                 capture_output=True, text=True)
+            if run.returncode != 0:
+                raise RuntimeError(f"{first}; ffmpeg also failed: {run.stderr.strip()[-300:]}")
+            data, rate = sf.read(str(tmp), dtype="float32", always_2d=True)
+        finally:
+            tmp.unlink(missing_ok=True)
     mono = data.mean(axis=1)
     if rate != SAMPLE_RATE:
         try:
@@ -1392,9 +1409,18 @@ class App:
             return
         cmd = native_picker_command() if self.cfg["native_file_picker"] else None
         if cmd:  # the desktop's own dialog (sidebar, bookmarks, recent files)
+            log.info("file picker: using %s", cmd[0])
             threading.Thread(target=self._native_pick, args=(cmd,), daemon=True).start()
-        else:
-            self.widget.send("pick_file")  # fallback: tkinter dialog on the tkinter thread
+            return
+        if self.cfg["native_file_picker"] and sys.platform.startswith("linux"):
+            log.warning("file picker: neither zenity nor kdialog found, using the basic dialog")
+            self.show_text("Basic file dialog in use",
+                           "PyKeet could not find the system file dialog tool, so it is showing "
+                           "the basic one (no sidebar).\n\nTo get your normal dialog:\n"
+                           "  Fedora:        sudo dnf install zenity\n"
+                           "  Debian/Ubuntu: sudo apt install zenity\n\n"
+                           "Then try again. Close this window to continue.")
+        self.widget.send("pick_file")  # fallback: tkinter dialog on the tkinter thread
 
     def _native_pick(self, cmd) -> None:
         try:
@@ -1589,7 +1615,8 @@ def check_dependencies() -> None:
 def main() -> None:
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))
-    log.info("PyKeet starting (python %s at %s)", sys.version.split()[0], sys.executable)
+    log.info("PyKeet %s starting (python %s at %s)", VERSION, sys.version.split()[0],
+             sys.executable)
     check_dependencies()
     try:
         import tkinter  # noqa: F401
