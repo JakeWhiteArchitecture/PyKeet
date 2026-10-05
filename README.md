@@ -3,7 +3,7 @@
 Local, offline dictation and call transcription, built on Moondream Parakeet.
 No cloud, no account, no word limits.
 
-- **Dictation:** hold `Ctrl+Space`, speak, release. Cleaned-up text appears at the cursor in whatever app has focus.
+- **Dictation:** press `Ctrl+Space`, speak, press `Ctrl+Space` again. Cleaned-up text appears at the cursor in whatever app has focus.
 - **Call mode:** press `Ctrl+Alt+R` at the start of a speakerphone call and again at the end. A timestamped, speaker-labelled Markdown transcript is saved to `~/CallTranscripts/`.
 
 > **Status:** the pure logic (text cleanup, replacements, speaker assignment, transcript format,
@@ -50,7 +50,7 @@ the first time, then fully offline); the tray shows "Ready." when it is done.
 
 | Shortcut | What it does |
 | --- | --- |
-| hold `Ctrl+Space` | Record; release to transcribe and insert (taps under 0.3 s are ignored) |
+| `Ctrl+Space` | Press once to start recording, press again to stop, transcribe and insert (presses under 0.3 s are ignored). Set `dictation_mode = "push"` in `config.toml` if you prefer hold-to-talk. |
 | `F8` | Re-insert the last dictation |
 | `Esc` while recording | Discard |
 | `Ctrl+Alt+R` | Start / stop call recording |
