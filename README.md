@@ -85,6 +85,27 @@ several to batch them). Each file is decoded to 16 kHz mono, transcribed with th
 unavailable while a recording or another job is running. Needs `soundfile` (in `requirements-optional.txt`); if a
 file can't be read, a window shows the exact reason.
 
+## Progress, parallel work and the transcript viewer
+
+- **Percent complete.** While a call or audio file is transcribed, the pill shows
+  `Transcribing ~37%` with a thin progress bar (then `Labelling speakers ~..%`). It is an
+  *estimate* from the audio length and how fast your machine has actually been (it learns from each
+  job and stores that in `speeds.json`), so the first job may be a little off. It holds at 99% until
+  the work really finishes.
+- **Dictation while a call transcribes.** With `parallel_workers = true` (default) a second copy of
+  the model does the call/file work, so `Ctrl+Space` dictation keeps working. Costs extra RAM (about
+  one more model) and both share your CPU, so each runs somewhat slower while they overlap. Set it to
+  `false` to use one model; dictation then waits until the call is done. Only one call/file job runs at
+  a time; start another when the pill disappears.
+- **Transcript viewer.** Imported files, and tray > Show last transcript, open a small Markdown viewer
+  (headings, bold speaker names, grey timestamps). Names / proper nouns (blue), phone numbers (green),
+  addresses and postcodes (orange), companies (purple) and emails (teal) are coloured. This is
+  rule-based guesswork, not AI: it will miss some and mark some places or products as names. Add anyone
+  or any firm you want always marked to `highlight_names` / `highlight_companies` in `config.toml`.
+  "Show raw Markdown" and "Copy all" give you the plain text.
+- **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
+  to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
+
 ## Call transcripts
 
 `YYYY-MM-DD_HHMM_call.md`, with blank Contact / Project / speaker-name lines to fill in by hand.

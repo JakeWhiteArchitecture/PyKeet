@@ -6,6 +6,8 @@ See README.md for setup, shortcuts and limitations.
 from __future__ import annotations
 
 import logging
+import getpass
+import json
 import logging.handlers
 import os
 import queue
@@ -14,6 +16,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -28,7 +31,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "0.4"
+VERSION = "0.5"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -82,7 +85,15 @@ dictation_beep = false
 # false = use the basic built-in dialog.
 native_file_picker = true
 
-# --- Calls -----------------------------------------------------------------
+# --- Calls ---
+# Run call/file transcription on a second copy of the model, so dictation keeps working
+# while a call is being transcribed. Costs extra RAM and shares your CPU.
+# false = one model; dictation waits until the call is done.
+parallel_workers = true
+# Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
+highlight_names = []
+highlight_companies = []
+--------------------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
 keep_audio = false        # keep the call WAV next to the transcript
@@ -109,6 +120,9 @@ DEFAULTS = {
     "call_shortcut": "ctrl+alt+r",
     "import_shortcut": "ctrl+alt+o",
     "native_file_picker": True,
+    "parallel_workers": True,
+    "highlight_names": [],
+    "highlight_companies": [],
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
     "call_model": "",
@@ -353,6 +367,222 @@ def build_markdown(started: datetime, duration: float, turns, labelled: bool, ru
 
 
 # --------------------------------------------------------------------------
+# Highlighting + a tiny Markdown renderer for the transcript viewer
+# --------------------------------------------------------------------------
+
+ENTITY_COLOURS = {  # soft backgrounds, readable with dark text
+    "name": "#cfe3ff", "phone": "#c9f0d2", "address": "#ffe0b5",
+    "company": "#e4d3ff", "email": "#c8f0f0",
+}
+ENTITY_LABELS = {"name": "Name / proper noun", "phone": "Phone", "address": "Address",
+                 "company": "Company", "email": "Email"}
+
+_DIGIT_WORDS = r"(?:oh|zero|nought|one|two|three|four|five|six|seven|eight|nine|double|triple)"
+_PHONE = re.compile(
+    r"(?<![\w.])(?:\+\d{1,3}[\s-]?\(?0?\)?[\s-]?\d{2,4}|\(?0\d{2,4}\)?)[\s-]?\d{3,4}[\s-]?\d{3,4}(?!\w)"
+    r"|(?<!\w)(?:" + _DIGIT_WORDS + r"[\s,-]+){6,}" + _DIGIT_WORDS + r"(?!\w)", re.I)
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_POSTCODE_SRC = r"[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}"
+_POSTCODE = re.compile(r"\b" + _POSTCODE_SRC + r"\b")
+_STREET_WORDS = (r"Road|Rd|Street|St|Lane|Ln|Avenue|Ave|Close|Drive|Dr|Way|Gardens|Crescent|"
+                 r"Place|Terrace|Court|Hill|Grove|Park|Mews|Square|Row|Walk|Green|Rise|Gate|"
+                 r"Lodge|House")
+_ADDRESS = re.compile(
+    r"\b\d{1,4}[A-Za-z]?\s+(?:[A-Z][\w'’-]*\s+){1,3}(?:" + _STREET_WORDS + r")\b"
+    r"(?:,\s+[A-Z][a-z]+)?(?:,?\s*" + _POSTCODE_SRC + r"\b)?")
+_COMPANY_WORDS = (r"Ltd|Limited|LLP|PLC|Plc|Inc|Architects|Architecture|Associates|Partnership|"
+                  r"Builders|Building|Construction|Homes|Group|Studio|Consultants|Consulting|"
+                  r"Engineers|Engineering|Surveyors|Developments|Contractors|Joinery|Services|"
+                  r"Design|Properties|Council|Bank|Insurance|Solicitors|Estates|Roofing|"
+                  r"Plumbing|Electrical|Heating|Landscapes|Landscaping|Kitchens")
+_COMPANY = re.compile(
+    r"(?:\b[A-Z][\w&'’-]*\s+){1,4}(?:" + _COMPANY_WORDS + r")\b"
+    r"|(?:\b[A-Z][\w'’-]+\s+){1,3}(?:&|and)\s+(?:Sons|Son|Co|Partners)\b")
+_NAME_CUE = re.compile(
+    r"(?i:\b(?:it['’]?s|it is|this is|my name is|name['’]s|i['’]m|i am|speaking to|"
+    r"speaking with|speak to|talk to|call from|calling from|called|ask for|hi|hello|hey|"
+    r"dear|thanks|thank you|cheers|morning|mr|mrs|ms|miss|dr)\b\.?)\s+"
+    r"(?P<n>[A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+){0,2})")
+_CAP_WORD = re.compile(r"[A-Z][a-z][\w'’-]*")
+_LEAD_STOP = {"hello", "hi", "hey", "thanks", "thank", "yes", "no", "so", "and", "but", "the",
+              "ok", "okay", "right", "well", "dear", "morning", "cheers", "yeah", "please",
+              "also", "then", "now", "it", "this", "that", "we", "they", "he", "she", "you"}
+_PROPER_STOP = _LEAD_STOP | {
+    "i", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december", "part", "speaker", "contact", "project", "date",
+    "duration", "source", "mr", "mrs", "ms", "miss", "dr"}
+
+
+def _sentence_start(text: str, i: int) -> bool:
+    j = i - 1
+    while j >= 0 and text[j] in " \t*\"'(":
+        j -= 1
+    return j < 0 or text[j] in ".?!:"
+
+
+def find_entities(text: str, names=(), companies=()) -> list[tuple[int, int, str]]:
+    """Heuristic spans (start, end, kind) for names, phones, addresses, companies, emails.
+
+    No language model involved, so it is a best guess: add people/firms you deal with to
+    `highlight_names` / `highlight_companies` in config.toml to have them always marked.
+    """
+    cands: list[tuple[int, int, int, str]] = []  # (priority, start, end, kind)
+
+    def add(prio, m_start, m_end, kind):
+        cands.append((prio, m_start, m_end, kind))
+
+    for lst, kind in ((names, "name"), (companies, "company")):
+        for item in lst:
+            if str(item).strip():
+                for m in re.finditer(r"(?<!\w)" + re.escape(str(item).strip()) + r"(?!\w)",
+                                     text, flags=re.I):
+                    add(0, m.start(), m.end(), kind)
+    for m in _PHONE.finditer(text):
+        add(1, m.start(), m.end(), "phone")
+    for m in _EMAIL.finditer(text):
+        add(1, m.start(), m.end(), "email")
+    for m in _ADDRESS.finditer(text):
+        add(2, m.start(), m.end(), "address")
+    for m in _POSTCODE.finditer(text):
+        add(2, m.start(), m.end(), "address")
+    for m in _COMPANY.finditer(text):
+        a, b = m.start(), m.end()
+        while True:  # trim leading filler like "Hello" from "Hello Smith Builders"
+            first = re.match(r"\s*(\S+)\s+", text[a:b])
+            if first and first.group(1).lower().strip(".,") in _LEAD_STOP:
+                a += first.end()
+            else:
+                break
+        if len(text[a:b].split()) > 1:
+            add(3, a, b, "company")
+    for m in _NAME_CUE.finditer(text):
+        add(4, m.start("n"), m.end("n"), "name")
+    # generic proper nouns in the middle of a sentence (the model capitalises names)
+    run: list[re.Match] = []
+
+    def flush():
+        if run:
+            add(5, run[0].start(), run[-1].end(), "name")
+            run.clear()
+
+    for m in _CAP_WORD.finditer(text):
+        w = m.group()
+        if w.lower() in _PROPER_STOP or _sentence_start(text, m.start()):
+            flush()
+            continue
+        if run and text[run[-1].end():m.start()] != " ":
+            flush()
+        run.append(m)
+    flush()
+
+    taken: list[tuple[int, int, str]] = []
+    for prio, a, b, kind in sorted(cands, key=lambda c: (c[0], -(c[2] - c[1]), c[1])):
+        if all(b <= ta or a >= tb for ta, tb, _ in taken):
+            taken.append((a, b, kind))
+    return sorted(taken)
+
+
+def md_segments(md: str, names=(), companies=(), highlight: bool = True):
+    """Turn Markdown into [(text, tags)] for a Tk Text widget.
+
+    Handles # / ## headings, '- ' bullets, **bold**, leading [mm:ss] timestamps, and (for
+    transcript lines) entity highlighting. Pure function so it can be tested without a GUI.
+    """
+    out: list[tuple[str, tuple]] = []
+    for line in md.split("\n"):
+        h = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if h:
+            out.append((h.group(2) + "\n", ("h1" if len(h.group(1)) == 1 else "h2",)))
+            continue
+        body, bullet = line, line.startswith("- ")
+        if bullet:
+            out.append(("•  ", ("bullet",)))
+            body = line[2:]
+        ts = re.match(r"^(\[\d+:\d\d(?::\d\d)?\])\s*", body)
+        if ts:
+            out.append((ts.group(1) + "  ", ("ts",)))
+            body = body[ts.end():]
+        # drop **bold** markers, remembering which characters were bold
+        plain, bold = "", []
+        for part in re.split(r"(\*\*.+?\*\*)", body):
+            is_b = len(part) > 4 and part.startswith("**") and part.endswith("**")
+            txt = part[2:-2] if is_b else part
+            plain += txt
+            bold += [is_b] * len(txt)
+        kinds = [None] * len(plain)
+        if highlight and not bullet and plain.strip():
+            for a, b, kind in find_entities(plain, names, companies):
+                for i in range(a, b):
+                    kinds[i] = kind
+        i = 0
+        while i < len(plain):
+            j = i
+            while j < len(plain) and bold[j] == bold[i] and kinds[j] == kinds[i]:
+                j += 1
+            tags = (("bold",) if bold[i] else ()) + ((kinds[i],) if kinds[i] else ())
+            out.append((plain[i:j], tags))
+            i = j
+        out.append(("\n", ()))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Speed estimates (for the percent-complete display) and single-instance lock
+# --------------------------------------------------------------------------
+
+SPEEDS_PATH = HERE / "speeds.json"
+SPEEDS = {"transcribe": 30.0, "diarize": 8.0}  # audio seconds processed per real second
+
+
+def load_speeds() -> None:
+    try:
+        saved = json.loads(SPEEDS_PATH.read_text(encoding="utf-8"))
+        for k in SPEEDS:
+            if isinstance(saved.get(k), (int, float)) and saved[k] > 0:
+                SPEEDS[k] = float(saved[k])
+    except Exception:
+        pass
+
+
+def update_speed(kind: str, audio_s: float, took_s: float) -> None:
+    """Blend a measured speed into the estimate so the percentage learns this machine."""
+    if audio_s < 20 or took_s < 1:
+        return  # too short to measure reliably (model warm-up dominates)
+    SPEEDS[kind] = round(0.5 * SPEEDS[kind] + 0.5 * (audio_s / took_s), 2)
+    try:
+        SPEEDS_PATH.write_text(json.dumps(SPEEDS), encoding="utf-8")
+    except Exception:
+        log.debug("could not save speeds", exc_info=True)
+
+
+_LOCK_HANDLE = None
+
+
+def acquire_single_instance() -> bool:
+    """True if we are the only PyKeet running for this user (two copies would both react
+    to every shortcut: two dialogs, two pastes)."""
+    global _LOCK_HANDLE
+    try:
+        user = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
+        fh = open(Path(tempfile.gettempdir()) / f"pykeet-{user}.lock", "w")
+        if sys.platform.startswith("win"):
+            import msvcrt
+
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except OSError:
+        return False
+    _LOCK_HANDLE = fh  # keep open for the life of the process
+    return True
+
+
+# --------------------------------------------------------------------------
 # WAV helpers (crash-safe: header is patched on close and repairable)
 # --------------------------------------------------------------------------
 
@@ -558,7 +788,7 @@ class Engine:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self._stack = ExitStack()
-        self._lock = threading.Lock()  # one transcription at a time
+        self._locks: dict[int, threading.Lock] = {}  # one transcription at a time PER model copy
         self._open_lock = threading.Lock()
         self.main = None
         self.call = None
@@ -576,21 +806,24 @@ class Engine:
         self.main = self._open(self.cfg["model"], self.cfg["device"])
 
     def for_call(self):
+        """Model for background jobs. A separate copy (opened on first use) when parallel
+        workers are on or a different call_model is set; otherwise the main one."""
         model = self.cfg["call_model"] or self.cfg["model"]
         device = self.cfg["call_device"] or self.cfg["device"]
-        if model == self.cfg["model"] and device == self.cfg["device"]:
+        same = model == self.cfg["model"] and device == self.cfg["device"]
+        if same and not self.cfg["parallel_workers"]:
             return self.main
         with self._open_lock:
             if self.call is None:
                 try:
                     self.call = self._open(model, device)
                 except Exception:
-                    log.exception("call_model failed to load; using main model")
+                    log.exception("second model copy failed to load; sharing the main model")
                     self.call = self.main
             return self.call
 
     def transcribe(self, speech, **kwargs) -> dict:
-        with self._lock:
+        with self._locks.setdefault(id(speech), threading.Lock()):
             return speech.transcribe(**kwargs)
 
     def close(self) -> None:
@@ -881,7 +1114,9 @@ class Widget:
             self.root.attributes("-transparentcolor", self.KEY)
         self.canvas.pack()
         self.bg = bg
-        self.state = "hidden"
+        self.state = "hidden"   # what is on screen right now
+        self.fg = "hidden"      # dictation / call-recording state (takes priority)
+        self.bgs = "none"       # background job state (call / file transcription)
         self.t0 = 0.0
         self.state_since = 0.0
         self.levels: deque = deque([0.0] * 10, maxlen=10)
@@ -955,16 +1190,19 @@ class Widget:
         try:
             while True:
                 item = self.q.get_nowait()
-                if isinstance(item, tuple):  # ("text", title, body, path)
-                    self._show_text(*item[1:])
+                if isinstance(item, tuple) and item[0] == "text":
+                    self._show_text(*item[1:])  # (title, body, path, markdown)
+                elif isinstance(item, tuple) and item[0] == "bg":
+                    self.bgs = item[1]
+                    self._apply()
                 else:
                     self._set(item)
         except queue.Empty:
             pass
         now = time.monotonic()
-        if self.state == "done" and now - self.state_since > 0.5:
+        if self.fg == "done" and now - self.state_since > 0.5:
             self._set("hidden")
-        elif self.state == "nospeech" and now - self.state_since > 1.0:
+        elif self.fg == "nospeech" and now - self.state_since > 1.0:
             self._set("hidden")
         if self.state != "hidden":
             self._draw()
@@ -977,43 +1215,89 @@ class Widget:
         if state == "pick_file":
             self._pick_file()
             return
-        self.state = state
+        self.fg = state
         self.state_since = time.monotonic()
         if state in ("rec", "call"):
             self.t0 = time.monotonic()
-        if state == "hidden":
-            self.root.withdraw()
-        else:
-            self.root.deiconify()
-            self.root.attributes("-topmost", True)
-            self.root.lift()
-            self._draw()
-            self.root.update_idletasks()
         log.info("widget state: %s", state)
+        self._apply()
 
-    def _show_text(self, title: str, body: str, path) -> None:
-        """Result window: scrollable transcript with Copy / Open file buttons."""
+    def _apply(self) -> None:
+        """Show the dictation/recording state if there is one, else the background job."""
+        eff = self.fg if self.fg != "hidden" else (self.bgs if self.bgs != "none" else "hidden")
+        was_hidden = self.state == "hidden"
+        self.state = eff
+        if eff == "hidden":
+            self.root.withdraw()
+            return
+        if was_hidden:
+            self.root.deiconify()
+        self.root.attributes("-topmost", True)
+        self.root.lift()
+        self._draw()
+        self.root.update_idletasks()
+
+    def _show_text(self, title: str, body: str, path, markdown: bool = False) -> None:
+        """Result window. Markdown mode renders headings/bold/timestamps and colours names,
+        phone numbers, addresses, companies and emails; Copy all copies the raw Markdown."""
         tk = self.tk
         win = tk.Toplevel(self.root)
         win.title(title)
-        win.geometry("760x560")
+        win.geometry("820x620")
         bar = tk.Frame(win)
         bar.pack(side="bottom", fill="x", padx=8, pady=6)
+        if markdown:  # colour legend
+            legend = tk.Frame(win)
+            legend.pack(side="bottom", fill="x", padx=8)
+            tk.Label(legend, text="Highlights (best guess):").pack(side="left")
+            for kind, colour in ENTITY_COLOURS.items():
+                tk.Label(legend, text=ENTITY_LABELS[kind], bg=colour, fg="#111",
+                         padx=6).pack(side="left", padx=3)
         frame = tk.Frame(win)
-        frame.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 0))
-        text = tk.Text(frame, wrap="word", font=("Consolas" if sys.platform.startswith("win")
-                                                 else "TkFixedFont", 11), undo=False)
+        frame.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 4))
+        win_font = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
+        text = tk.Text(frame, wrap="word", font=(win_font, 11), padx=10, pady=8, spacing3=4,
+                       undo=False)
         scroll = tk.Scrollbar(frame, command=text.yview)
         text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         text.pack(side="left", fill="both", expand=True)
-        text.insert("1.0", body)
+        text.tag_configure("h1", font=(win_font, 17, "bold"), spacing1=4, spacing3=8)
+        text.tag_configure("h2", font=(win_font, 13, "bold"), spacing1=8)
+        text.tag_configure("bold", font=(win_font, 11, "bold"))
+        text.tag_configure("ts", foreground="#777777", font=("TkFixedFont", 10))
+        text.tag_configure("bullet", foreground="#555555")
+        for kind, colour in ENTITY_COLOURS.items():
+            text.tag_configure(kind, background=colour, foreground="#111111")
+        text.tag_raise("sel")
+        showing_raw = {"on": not markdown}
+
+        def render():
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            if showing_raw["on"]:
+                text.insert("1.0", body)
+            else:
+                cfg = self.app.cfg
+                for chunk, tags in md_segments(body, cfg.get("highlight_names") or (),
+                                               cfg.get("highlight_companies") or ()):
+                    text.insert("end", chunk, tags)
+            text.configure(state="disabled")  # read-only, but selecting/copying still works
 
         def copy():
             win.clipboard_clear()
-            win.clipboard_append(text.get("1.0", "end-1c"))
+            win.clipboard_append(body)
 
+        def toggle():
+            showing_raw["on"] = not showing_raw["on"]
+            raw_btn.configure(text="Show formatted" if showing_raw["on"] else "Show raw Markdown")
+            render()
+
+        render()
         tk.Button(bar, text="Copy all", command=copy).pack(side="left")
+        raw_btn = tk.Button(bar, text="Show raw Markdown", command=toggle)
+        if markdown:
+            raw_btn.pack(side="left", padx=6)
         if path:
             tk.Button(bar, text="Open file", command=lambda: open_path(path)).pack(
                 side="left", padx=6)
@@ -1072,12 +1356,19 @@ class Widget:
         elif st == "transcribing":
             dot("#ffb020")
             text(44, "Transcribing…")
-        elif st in ("call_transcribing", "call_labelling"):
-            frames = "|/-\\"
-            spin = frames[int(now * 8) % 4]
+        elif st == "call_preparing":
             dot("#ffb020")
-            text(44, ("Transcribing call… " if st == "call_transcribing"
-                      else "Labelling speakers… ") + spin)
+            text(44, "Preparing…" + self.app.bg_note)
+        elif st in ("call_transcribing", "call_labelling"):
+            dot("#ffb020")
+            p = self.app.progress()
+            pct = f" ~{int(p * 100)}%" if p is not None else ""
+            text(44, ("Transcribing" if st == "call_transcribing" else "Labelling speakers")
+                 + self.app.bg_note + pct)
+            if p is not None:  # thin progress bar along the bottom of the pill
+                x0, x1, y = 44, self.W - 26, self.H - 9
+                c.create_rectangle(x0, y, x1, y + 3, fill="#3a3a44", outline="")
+                c.create_rectangle(x0, y, x0 + (x1 - x0) * p, y + 3, fill="#ffb020", outline="")
         elif st == "done":
             dot("#40d070")
             text(44, "Done", "#40d070")
@@ -1114,6 +1405,16 @@ class App:
         self._call_started: datetime | None = None
         self._call_wav: Path | None = None
         self._quitting = False
+        # background job (call / file transcription), tracked separately from `mode` so
+        # dictation can carry on while it runs
+        self.bg_busy = False
+        self.bg_phase: str | None = None
+        self.bg_kind = "transcribe"
+        self.bg_audio = 0.0
+        self.bg_started = 0.0
+        self.bg_expected = 1.0
+        self.bg_note = ""
+        self._diarize_warm = False
         threading.Thread(target=self._action_loop, daemon=True).start()
 
     # -- plumbing -------------------------------------------------------------
@@ -1135,7 +1436,38 @@ class App:
 
     @property
     def dictation_enabled(self) -> bool:
-        return self.ready and not self.paused and self.mode != "call"
+        if not self.ready or self.paused or self.mode == "call":
+            return False
+        return self.cfg["parallel_workers"] or not self.bg_busy
+
+    # -- background job progress ------------------------------------------------
+    def bg_ui(self, phase: str | None) -> None:
+        self.bg_phase = phase
+        if self.widget:
+            self.widget.q.put(("bg", phase or "none"))
+        self._refresh_tray()
+
+    def bg_begin(self, phase: str, audio_seconds: float, kind: str) -> None:
+        self.bg_kind, self.bg_audio = kind, audio_seconds
+        self.bg_started = time.monotonic()
+        self.bg_expected = max(4.0, audio_seconds / SPEEDS[kind])
+        self.bg_ui(phase)
+
+    def bg_end_phase(self, record: bool = True) -> None:
+        if record:
+            update_speed(self.bg_kind, self.bg_audio, time.monotonic() - self.bg_started)
+
+    def bg_done(self) -> None:
+        self.bg_busy = False
+        self.bg_note = ""
+        self.bg_ui(None)
+
+    def progress(self) -> float | None:
+        """Estimated fraction done for the current phase (an estimate from audio length and
+        measured speed, capped at 99% until the phase really finishes)."""
+        if self.bg_phase in ("call_transcribing", "call_labelling"):
+            return min(0.99, (time.monotonic() - self.bg_started) / self.bg_expected)
+        return None
 
     def _set_idle(self) -> None:
         with self.lock:
@@ -1186,9 +1518,11 @@ class App:
             if duration < 1:
                 wav.unlink(missing_ok=True)
                 continue
-            with self.lock:
-                self.mode, self.phase = "call", "processing"
-            self.process_call(wav, started, duration, recovered=True)
+            self.bg_busy = True
+            try:
+                self.process_call(wav, started, duration, recovered=True, keep_busy=True)
+            finally:
+                self.bg_done()
 
     # -- dictation --------------------------------------------------------------
     def on_dictation_press(self) -> None:
@@ -1281,11 +1615,15 @@ class App:
         if self.mode == "call" and self.phase == "recording":
             self.stop_call()
         elif self.mode == "idle":
+            if self.bg_busy:
+                self.notify("PyKeet", "Still transcribing the previous recording. "
+                            "Start the next call when that finishes.")
+                return
             self.start_call()
 
     def start_call(self) -> None:
         with self.lock:
-            if not self.ready or self.mode != "idle":
+            if not self.ready or self.mode != "idle" or self.bg_busy:
                 return
             TMP_DIR.mkdir(exist_ok=True)
             self._call_started = datetime.now()
@@ -1317,8 +1655,17 @@ class App:
         log.info("call: recording stopped after %.0fs", duration)
         wav, started = self._call_wav, self._call_started
         assert wav is not None and started is not None
-        threading.Thread(target=self.process_call, args=(wav, started, duration),
+        self.bg_busy = True
+        self._set_idle()  # free for dictation while the call is transcribed
+        self.ui("hidden")
+        threading.Thread(target=self._process_call_job, args=(wav, started, duration),
                          daemon=True).start()
+
+    def _process_call_job(self, wav, started, duration) -> None:
+        try:
+            self.process_call(wav, started, duration, keep_busy=True)
+        finally:
+            self.bg_done()
 
     def run_diarize(self, wav: Path, duration: float):
         import diarize  # lazy: only loaded on first call-mode use
@@ -1347,11 +1694,13 @@ class App:
                      keep_busy: bool = False) -> None:
         t0 = time.monotonic()
         try:
-            self.ui("call_transcribing")
+            self.bg_ui("call_preparing")
             want_labels = bool(self.cfg["label_speakers"])
-            speech = self.engine.for_call()
+            speech = self.engine.for_call()  # may load a second model copy the first time
+            self.bg_begin("call_transcribing", duration, "transcribe")
             result = self.engine.transcribe(
                 speech, audio=str(wav), timestamps="word" if want_labels else "segment")
+            self.bg_end_phase()
             units, word_level = extract_units(result)
             log.info("call: transcribed %.0fs in %.1fs (%d units)", duration,
                      time.monotonic() - t0, len(units))
@@ -1359,9 +1708,11 @@ class App:
             turns = None
             if want_labels and word_level and units:
                 try:
-                    self.ui("call_labelling")
+                    self.bg_begin("call_labelling", duration, "diarize")
                     t1 = time.monotonic()
                     segments = self.run_diarize(wav, duration)
+                    self.bg_end_phase(record=self._diarize_warm)  # 1st run includes model load
+                    self._diarize_warm = True
                     if not segments:
                         raise RuntimeError("diarisation returned no segments")
                     turns = build_turns(assign_speakers(units, segments))
@@ -1384,8 +1735,8 @@ class App:
             log.info("call: saved %s (labelled=%s) total %.1fs", path.name, labelled,
                      time.monotonic() - t0)
             self.notify("Transcript saved", path.name, path)
-            if source and self.widget:
-                self.widget.q.put(("text", f"Transcript: {source}", md, path))
+            if source:
+                self.show_text(f"Transcript: {source}", md, path, markdown=True)
         except Exception:
             log.exception("call processing failed; audio kept at %s", wav)
             if source:  # the original file is untouched; drop our decoded copy
@@ -1395,16 +1746,15 @@ class App:
                 self.notify("PyKeet", f"Call transcription failed. Audio kept: {wav.name}")
         finally:
             if not keep_busy:
-                self._set_idle()
-            self.ui("hidden")
+                self.bg_done()
 
     # -- audio file import ----------------------------------------------------------
-    def show_text(self, title: str, body: str, path=None) -> None:
+    def show_text(self, title: str, body: str, path=None, markdown: bool = False) -> None:
         if self.widget:
-            self.widget.q.put(("text", title, body, path))
+            self.widget.q.put(("text", title, body, path, markdown))
 
     def request_file_picker(self) -> None:
-        if not (self.ready and self.mode == "idle" and self.widget):
+        if not (self.ready and self.mode == "idle" and not self.bg_busy and self.widget):
             self.notify("PyKeet", "Busy or still loading. Try again in a moment.")
             return
         cmd = native_picker_command() if self.cfg["native_file_picker"] else None
@@ -1436,9 +1786,9 @@ class App:
 
     def import_files(self, paths) -> None:
         with self.lock:
-            if not self.ready or self.mode != "idle":
+            if not self.ready or self.mode != "idle" or self.bg_busy:
                 return
-            self.mode, self.phase = "call", "processing"  # blocks recording meanwhile
+            self.bg_busy = True  # one background job at a time; dictation stays available
         threading.Thread(target=self._import_worker, args=(list(paths),), daemon=True).start()
 
     def _import_worker(self, paths) -> None:
@@ -1447,8 +1797,9 @@ class App:
             for i, raw in enumerate(paths):
                 src = Path(raw)
                 wav = TMP_DIR / f"import_{datetime.now():%Y%m%d_%H%M%S}_{i}.wav"
+                self.bg_note = f" ({i + 1}/{len(paths)})" if len(paths) > 1 else ""
                 try:
-                    self.ui("call_transcribing")
+                    self.bg_ui("call_preparing")
                     duration = decode_to_wav(src, wav)
                 except Exception as exc:
                     log.exception("could not read audio file %s", src.name)
@@ -1472,8 +1823,7 @@ class App:
                 log.info("importing %s (%.0fs)", src.name, duration)
                 self.process_call(wav, started, duration, source=src.name, keep_busy=True)
         finally:
-            self._set_idle()
-            self.ui("hidden")
+            self.bg_done()
 
     def _save_transcript(self, started: datetime, md: str, source: str | None = None) -> Path:
         folder = Path(os.path.expanduser(self.cfg["transcript_folder"]))
@@ -1560,15 +1910,19 @@ class App:
         log.info("dictation %s", "paused" if self.paused else "resumed")
 
     def show_last(self) -> None:
-        if self.last_transcript and self.last_transcript.exists():
-            open_path(self.last_transcript)
+        path = self.last_transcript
+        if not (path and path.exists()):
+            folder = Path(os.path.expanduser(self.cfg["transcript_folder"]))
+            files = sorted(folder.glob("*.md")) if folder.exists() else []
+            path = files[-1] if files else None
+        if not path:
+            self.notify("PyKeet", "No transcripts yet.")
             return
-        folder = Path(os.path.expanduser(self.cfg["transcript_folder"]))
-        files = sorted(folder.glob("*_call*.md")) if folder.exists() else []
-        if files:
-            open_path(files[-1])
-        else:
-            self.notify("PyKeet", "No call transcripts yet.")
+        try:
+            self.show_text(f"Transcript: {path.name}", path.read_text(encoding="utf-8"),
+                           path, markdown=True)
+        except OSError:
+            open_path(path)
 
     def open_folder(self) -> None:
         folder = Path(os.path.expanduser(self.cfg["transcript_folder"]))
@@ -1618,6 +1972,12 @@ def main() -> None:
     log.info("PyKeet %s starting (python %s at %s)", VERSION, sys.version.split()[0],
              sys.executable)
     check_dependencies()
+    if not acquire_single_instance():
+        log.error("PyKeet is already running; exiting")
+        sys.exit("PyKeet is already running (another copy). Two copies both react to every "
+                 "shortcut, giving double dialogs and double pastes.\n"
+                 "Close the other one first, e.g.:  pkill -f main.py")
+    load_speeds()
     try:
         import tkinter  # noqa: F401
     except ImportError:

@@ -5,6 +5,8 @@ dictation_shortcut = "ctrl+space"
 recall_shortcut = "f8"
 cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
+# Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
+import_shortcut = "ctrl+alt+o"
 
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
@@ -27,7 +29,19 @@ cleanup = true            # strip um/uh, collapse repeats, apply replacements
 insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
 dictation_beep = false
 
-# --- Calls -----------------------------------------------------------------
+# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
+# false = use the basic built-in dialog.
+native_file_picker = true
+
+# --- Calls ---
+# Run call/file transcription on a second copy of the model, so dictation keeps working
+# while a call is being transcribed. Costs extra RAM and shares your CPU.
+# false = one model; dictation waits until the call is done.
+parallel_workers = true
+# Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
+highlight_names = []
+highlight_companies = []
+--------------------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
 keep_audio = false        # keep the call WAV next to the transcript
