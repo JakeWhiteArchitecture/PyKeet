@@ -39,6 +39,14 @@ native_file_picker = true
 # jobs wait in a queue. Dictation always has its own separate model and only ever runs one
 # at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
 call_workers = 2
+# Cut long silences out of a call / audio file before transcribing (faster, and cleaner for
+# the model). A silence is only cut once speech has clearly resumed, and `silence_keep_seconds`
+# of the quiet either side is always kept so the first sound of returning speech is never
+# clipped. Timestamps in the transcript are still real call time. The saved audio is untouched.
+trim_silence = true
+silence_min_seconds = 3.0     # only silences at least this long are shortened
+silence_keep_seconds = 0.6    # quiet kept before and after the speech
+silence_threshold_db = 0      # 0 = automatic (adapts to your room noise); or e.g. -45
 # Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
 highlight_names = []
 highlight_companies = []
