@@ -101,6 +101,13 @@ file can't be read, a window shows the exact reason.
   model per worker) and your CPU is shared, so each job is slower while they overlap. Set
   `call_workers = 1` for a single background job, or `0` to share the dictation model (dictation then
   waits while a call job runs).
+- **Silence trimming (dictation only).** When you dictate, long silent pauses (e.g. you stop to think) are
+  cut out before transcribing (`trim_dictation_silence = true`). Only silences of
+  `dictation_silence_min_seconds` (2 s) or more are shortened, and `dictation_silence_keep_seconds`
+  (0.4 s) of quiet is always kept before and after your speech, so the first sound of a returning voice
+  is never clipped; shorter pauses are untouched. A silence is only cut once speech has clearly resumed
+  after it, and the level adapts to your room noise (set `dictation_silence_threshold_db` to a number like
+  `-45` to override). Calls, meetings and imported audio files are **not** trimmed.
 - **Transcript viewer.** Imported files, and tray > Show last transcript, open a small Markdown viewer
   (headings, bold speaker names, grey timestamps). Names / proper nouns (blue), phone numbers (green),
   addresses and postcodes (orange), companies (purple) and emails (teal) are coloured. This is
