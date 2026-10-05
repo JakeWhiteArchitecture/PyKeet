@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.2"
+VERSION = "1.3"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -140,7 +140,8 @@ highlight_actions = true
 #                    word overlap. No install; improve it by adding your own phrases.
 #   "needle-phrases" the same phrase bank compared by MEANING with Needle 3's embeddings, so
 #                    different wording still matches (`pip install cactus-needle`).
-# Test any of them with:  python main.py --explain "a sentence"
+# Test any of them with:  python main.py --explain "a sentence"   (one sentence)
+#                         python main.py --evaluate               (50 labelled sentences, scores)
 action_backend = "zeroshot"
 action_model = ""
 action_server = "http://127.0.0.1:8080"
@@ -2841,6 +2842,106 @@ def check_dependencies() -> None:
                         ", ".join(missing), sys.executable, " ".join(missing))
 
 
+# Labelled sentences for `python main.py --evaluate` (none of them are in the phrase bank).
+# First 20 are clearly worded, the next 14 are messy natural speech, the last 16 are unseen.
+EVAL_SETS = {
+    "clear": [
+        ("decision_open", "We still need to decide whether to go with oak or larch for the cladding."),
+        ("decision_open", "Should we put the bifold doors on the garden side?"),
+        ("decision_open", "I'm not sure which one the client prefers."),
+        ("option", "Option A is the single storey extension, option B adds a loft conversion."),
+        ("option", "Alternatively we could split the kitchen and the utility."),
+        ("option", "We could go with brick or we could use render."),
+        ("decision_made", "We've decided to go with the larch cladding."),
+        ("decision_made", "Right, let's go with option B then."),
+        ("decision_made", "That's agreed, the windows are staying where they are."),
+        ("task_open", "I'll send the revised drawings over on Friday."),
+        ("task_open", "Can you please chase the structural engineer about the beam?"),
+        ("task_open", "We need to book the site visit before the end of the month."),
+        ("task_open", "Don't forget to update the planning statement."),
+        ("task_done", "I've already sent the invoice to Sarah."),
+        ("task_done", "The planning application has been submitted."),
+        ("task_done", "That's all done and sorted now."),
+        (None, "The weather was awful on the day of the site visit."),
+        (None, "Yeah, okay, mm."),
+        (None, "The roof is about three metres high at the ridge."),
+        (None, "It was a lovely house with a big garden and an old oak tree.")],
+    "messy": [
+        ("decision_made", "So yeah I think we'll go larch."),
+        ("decision_made", "Okay so we're doing the oak then."),
+        ("task_open", "Can we get the drawings to the engineer by Friday?"),
+        ("task_open", "He's going to ring you tomorrow about the quote."),
+        ("task_open", "Somebody needs to chase the council."),
+        ("task_done", "I sent it yesterday afternoon."),
+        ("task_done", "The engineer got back to us this morning."),
+        ("decision_open", "What do you reckon, brick or render?"),
+        ("decision_open", "Do you want the rooflight over the stairs or not?"),
+        ("option", "One way is to push the wall back, the other is to leave it."),
+        (None, "We should really get a coffee, it's been a long meeting."),
+        (None, "I will say the previous architect did a good job."),
+        (None, "We have to be careful with the neighbours."),
+        (None, "Please hold on a second while I find the plan.")],
+    "unseen": [
+        ("decision_open", "Do we want to keep the chimney or take it down?"),
+        ("decision_open", "I haven't made up my mind about the staircase yet."),
+        ("decision_open", "Which of the two layouts do you like better?"),
+        ("decision_made", "Fine, we'll use the oak flooring."),
+        ("decision_made", "The council has said yes so we're proceeding."),
+        ("option", "Either we widen the opening or we add a second door."),
+        ("option", "There's a cheaper route and a more expensive route."),
+        ("task_open", "I'll draw that up and send it to you."),
+        ("task_open", "Could you let the neighbour know about the scaffold?"),
+        ("task_open", "Someone has to measure the loft."),
+        ("task_done", "We paid the deposit on Monday."),
+        ("task_done", "I've updated the drawings already."),
+        (None, "The kitchen is at the back of the house."),
+        (None, "Lovely, thank you."),
+        (None, "It's about a twenty minute walk from the station."),
+        (None, "The old shed is falling apart.")],
+}
+
+
+def evaluate() -> None:
+    """`python main.py --evaluate`: score the configured detector on 50 labelled sentences."""
+    cfg = load_config()
+    logging.basicConfig(level=logging.WARNING)
+    backend = str(cfg.get("action_backend") or "zeroshot")
+    print(f"Backend: {backend}  model: {cfg.get('action_model') or '(none)'}")
+    model = get_action_model(str(cfg.get("action_model") or ""), backend,
+                             str(cfg.get("action_server") or ""),
+                             float(cfg.get("phrase_min_similarity") or 0))
+    if model is None:
+        print("(backend not available, see the warning above: showing the phrase rules only)")
+    flat = [(name, w, t) for name, rows in EVAL_SETS.items() for w, t in rows]
+    t0 = time.monotonic()
+    preds = model.predict([t for _n, _w, t in flat]) if model else [(None, 0.0)] * len(flat)
+    took = time.monotonic() - t0
+    tally: dict[str, list[int]] = {n: [0, 0, 0, 0] for n in EVAL_SETS}
+    misses = []
+    for (name, want, text), (mk, score) in zip(flat, preds):
+        rule = classify_sentence(text)
+        alone = mk if (mk is not None and score >= 0.5) or (mk is None and score >= 0.75) else None
+        both = combine_kind(rule, mk, score)
+        row = tally[name]
+        row[0] += 1
+        row[1] += rule == want
+        row[2] += alone == want
+        row[3] += both == want
+        if both != want:
+            misses.append((want, both, text))
+    print(f"\n{'set':8}{'n':>4}{'rules':>8}{'model':>8}{'combined':>10}")
+    total = [0, 0, 0, 0]
+    for name, row in tally.items():
+        print(f"{name:8}{row[0]:>4}{row[1]:>8}{row[2]:>8}{row[3]:>10}")
+        total = [a + b for a, b in zip(total, row)]
+    print(f"{'ALL':8}{total[0]:>4}{total[1]:>8}{total[2]:>8}{total[3]:>10}")
+    if model:
+        print(f"\nModel time: {took:.1f}s for {len(flat)} sentences ({took / len(flat):.2f}s each)")
+    print("\nStill wrong when combined (wanted -> got):")
+    for want, got, text in misses:
+        print(f"  {str(want):14} -> {str(got):14} {text}")
+
+
 def explain(sentence: str) -> None:
     """`python main.py --explain "some sentence"`: show how the detector sees a sentence."""
     cfg = load_config()
@@ -2865,6 +2966,9 @@ def explain(sentence: str) -> None:
 def main() -> None:
     if len(sys.argv) > 2 and sys.argv[1] == "--explain":
         explain(" ".join(sys.argv[2:]))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--evaluate":
+        evaluate()
         return
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))

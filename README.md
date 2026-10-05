@@ -144,7 +144,9 @@ file can't be read, a window shows the exact reason.
   word overlap: on my 50-sentence check it lifted messy speech from 4/14 to 8/14 when combined with the
   rules, with one more false hit, so it is a modest help. `action_backend = "needle-phrases"` compares the
   same phrases by *meaning* using Needle 3's embeddings (so "we'll go larch" can match "let's go with
-  that"); that one is untested on real speech. See why a sentence got its label with
+  that"); that one is untested on real speech. See why a sentence got its label with To compare backends or models on your own machine, set `action_backend` /
+  `action_model` and run `python main.py --evaluate`: it scores the rules, the model alone and the two
+  combined on 50 labelled sentences, shows the time per sentence and lists what is still wrong.
   `python main.py --explain "so yeah I think we'll go larch"`.
 You can also point PyKeet at a model server you run yourself:
   `action_backend = "server"` and `action_server = "http://127.0.0.1:8080"` (llama.cpp's

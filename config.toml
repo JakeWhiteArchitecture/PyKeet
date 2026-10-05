@@ -85,7 +85,8 @@ highlight_actions = true
 #                    word overlap. No install; improve it by adding your own phrases.
 #   "needle-phrases" the same phrase bank compared by MEANING with Needle 3's embeddings, so
 #                    different wording still matches (`pip install cactus-needle`).
-# Test any of them with:  python main.py --explain "a sentence"
+# Test any of them with:  python main.py --explain "a sentence"   (one sentence)
+#                         python main.py --evaluate               (50 labelled sentences, scores)
 action_backend = "zeroshot"
 action_model = ""
 action_server = "http://127.0.0.1:8080"
