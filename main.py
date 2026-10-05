@@ -53,6 +53,8 @@ dictation_shortcut = "ctrl+space"
 recall_shortcut = "f8"
 cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
+# Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
+import_shortcut = "ctrl+alt+o"
 
 # "push" = hold to talk, "toggle" = press to start, press to stop
 dictation_mode = "push"
@@ -99,6 +101,7 @@ DEFAULTS = {
     "recall_shortcut": "f8",
     "cancel_shortcut": "esc",
     "call_shortcut": "ctrl+alt+r",
+    "import_shortcut": "ctrl+alt+o",
     "dictation_mode": "push",
     "model": "moondream/parakeet-redux",
     "call_model": "",
@@ -668,6 +671,7 @@ class Hotkeys:
         self.recall = parse_shortcut(cfg["recall_shortcut"])
         self.cancel = parse_shortcut(cfg["cancel_shortcut"])
         self.call = parse_shortcut(cfg["call_shortcut"])
+        self.importer = parse_shortcut(cfg["import_shortcut"])
         self.down: set[str] = set()
         self.last_press: dict[str, float] = {}
         self.ptt_active = False
@@ -686,13 +690,21 @@ class Hotkeys:
         others = self.down - {name}
 
         mods, main = self.dictation
+        if name == main and mods <= others and not self.app.dictation_enabled:
+            log.info("dictation hotkey seen but ignored (ready=%s paused=%s mode=%s)",
+                     self.app.ready, self.app.paused, self.app.mode)
         if name == main and mods <= others and self.app.dictation_enabled:
+            log.info("hotkey: dictation")
             self.ptt_active = True
             self.app.post(self.app.on_dictation_press)
             return
         mods, main = self.call
         if name == main and mods <= others:
             self.app.post(self.app.toggle_call)
+            return
+        mods, main = self.importer
+        if name == main and mods <= others:
+            self.app.post(self.app.request_file_picker)
             return
         mods, main = self.recall
         if name == main and mods <= others:
@@ -714,6 +726,8 @@ class Hotkeys:
     def _on_press(self, key):
         n = key_name(key)
         if n:
+            if self.app.cfg["debug"]:
+                log.debug("key down: %s (held: %s)", n, sorted(self.down))
             self.press(n)
 
     def _on_release(self, key):
@@ -765,6 +779,7 @@ class Hotkeys:
         return chr(vk).lower()
 
     def start(self) -> None:
+        log.info("session type: %s", os.environ.get("XDG_SESSION_TYPE", "unknown"))
         if os.environ.get("XDG_SESSION_TYPE") == "wayland":
             log.warning("Wayland session: global hotkeys will not work. Use an X11 session.")
         try:
@@ -925,7 +940,10 @@ class Widget:
         else:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
+            self.root.lift()
             self._draw()
+            self.root.update_idletasks()
+        log.info("widget state: %s", state)
 
     def _show_text(self, title: str, body: str, path) -> None:
         """Result window: scrollable transcript with Copy / Open file buttons."""
@@ -1494,10 +1512,30 @@ class App:
         self.ui("quit")
 
 
+def check_dependencies() -> None:
+    """Log exactly which packages are missing, and which Python is running."""
+    import importlib.util
+
+    groups = [
+        ("REQUIRED", [("moondream", "moondream"), ("numpy", "numpy"),
+                      ("sounddevice", "sounddevice"), ("pynput", "pynput"),
+                      ("pyperclip", "pyperclip")]),
+        ("optional (tray icon + file picker)", [("pystray", "pystray"), ("PIL", "Pillow")]),
+        ("optional (audio file import)", [("soundfile", "soundfile"), ("scipy", "scipy")]),
+        ("optional (speaker labels)", [("diarize", "diarize")]),
+    ]
+    for label, mods in groups:
+        missing = [pkg for mod, pkg in mods if importlib.util.find_spec(mod) is None]
+        if missing:
+            log.warning("Missing %s: %s  ->  %s -m pip install %s", label,
+                        ", ".join(missing), sys.executable, " ".join(missing))
+
+
 def main() -> None:
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))
-    log.info("PyKeet starting (python %s)", sys.version.split()[0])
+    log.info("PyKeet starting (python %s at %s)", sys.version.split()[0], sys.executable)
+    check_dependencies()
     try:
         import tkinter  # noqa: F401
     except ImportError:

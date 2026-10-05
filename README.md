@@ -19,9 +19,15 @@ Python 3.10+ (moondream needs 3.10 or newer).
 ```
 python -m venv .venv
 # Windows:  .venv\Scripts\activate      Linux/macOS:  source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt            # core: dictation + calls
+pip install -r requirements-optional.txt   # tray icon, file import, speaker labels
 python main.py
 ```
+
+The two files are separate on purpose: if an optional package (usually `diarize`, which pulls in
+PyTorch) fails to install, the core app still works. At startup PyKeet logs which packages are
+missing and the exact `pip` command for the Python it is running. Always run `python main.py` from
+the same terminal/venv you installed into.
 
 Linux also needs: `sudo apt install python3-tk xclip libportaudio2` (plus `libnotify-bin` for notifications).
 `config.toml` is created next to `main.py` on first run. The first start loads the model (a download
@@ -37,6 +43,7 @@ the first time, then fully offline); the tray shows "Ready." when it is done.
 | `F8` | Re-insert the last dictation |
 | `Esc` while recording | Discard |
 | `Ctrl+Alt+R` | Start / stop call recording |
+| `Ctrl+Alt+O` | Open the audio file picker (same as the tray item) |
 
 Widget: click while dictating = stop and insert, right-click = cancel. It is draggable and remembers its
 position. During a call it shows "CALL" and ignores clicks; stop with the shortcut or the tray menu.
@@ -57,7 +64,7 @@ first time you record a call).
 
 ## Transcribing an audio file
 
-Tray menu > **Transcribe audio file…** opens a file picker for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
+Tray menu > **Transcribe audio file…** (or `Ctrl+Alt+O`, handy if your desktop has no tray) opens a file picker for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
 several to batch them). Each file is decoded to 16 kHz mono, transcribed with the call settings
 (speaker labelling included, same fallbacks), and saved in your transcript folder as
 `YYYY-MM-DD_HHMM_<filename>.md`. When it finishes, a **text window** shows the transcript with

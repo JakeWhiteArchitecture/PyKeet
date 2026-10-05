@@ -1,11 +1,6 @@
+# Core: needed for dictation and call transcription
 moondream>=2.4.1
 numpy
 sounddevice
 pynput
 pyperclip
-pystray
-Pillow
-diarize
-soundfile
-scipy
-tomli; python_version < "3.11"
