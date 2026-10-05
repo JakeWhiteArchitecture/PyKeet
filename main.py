@@ -316,14 +316,16 @@ def group_lines(units, word_level: bool):
 
 
 def build_markdown(started: datetime, duration: float, turns, labelled: bool, rules,
-                   recovered: bool = False) -> str:
+                   recovered: bool = False, source: str | None = None) -> str:
     out = [
-        "# Call transcript",
+        "# Audio transcript" if source else "# Call transcript",
         f"- Date: {started:%Y-%m-%d %H:%M}",
         f"- Duration: {fmt_duration(duration)}",
         "- Contact:",
         "- Project:",
     ]
+    if source:
+        out.insert(1, f"- Source: {source}")
     if recovered:
         out.append("- Note: recovered after the app stopped mid-call")
     if labelled:
@@ -387,6 +389,30 @@ class WavWriter:
 # --------------------------------------------------------------------------
 # Audio capture
 # --------------------------------------------------------------------------
+
+AUDIO_TYPES = [("Audio files", "*.mp3 *.ogg *.flac *.wav"), ("All files", "*.*")]
+
+
+def decode_to_wav(src: Path, dest: Path) -> float:
+    """Decode mp3/ogg/flac/wav to 16 kHz mono 16-bit WAV. Returns duration in s."""
+    import soundfile as sf
+    from math import gcd
+
+    from scipy.signal import resample_poly
+
+    data, rate = sf.read(str(src), dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)
+    if rate != SAMPLE_RATE:
+        g = gcd(SAMPLE_RATE, int(rate))
+        mono = resample_poly(mono, SAMPLE_RATE // g, int(rate) // g).astype("float32")
+    w = WavWriter(dest)
+    try:
+        for i in range(0, len(mono), SAMPLE_RATE * 60):
+            w.write(mono[i:i + SAMPLE_RATE * 60])
+    finally:
+        duration = w.close()
+    return duration
+
 
 def parse_input_device(value):
     if value in ("", None):
@@ -867,7 +893,11 @@ class Widget:
     def _poll(self) -> None:
         try:
             while True:
-                self._set(self.q.get_nowait())
+                item = self.q.get_nowait()
+                if isinstance(item, tuple):  # ("text", title, body, path)
+                    self._show_text(*item[1:])
+                else:
+                    self._set(item)
         except queue.Empty:
             pass
         now = time.monotonic()
@@ -883,6 +913,9 @@ class Widget:
         if state == "quit":
             self.root.quit()
             return
+        if state == "pick_file":
+            self._pick_file()
+            return
         self.state = state
         self.state_since = time.monotonic()
         if state in ("rec", "call"):
@@ -893,6 +926,45 @@ class Widget:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
             self._draw()
+
+    def _show_text(self, title: str, body: str, path) -> None:
+        """Result window: scrollable transcript with Copy / Open file buttons."""
+        tk = self.tk
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("760x560")
+        bar = tk.Frame(win)
+        bar.pack(side="bottom", fill="x", padx=8, pady=6)
+        frame = tk.Frame(win)
+        frame.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 0))
+        text = tk.Text(frame, wrap="word", font=("Consolas" if sys.platform.startswith("win")
+                                                 else "TkFixedFont", 11), undo=False)
+        scroll = tk.Scrollbar(frame, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        text.insert("1.0", body)
+
+        def copy():
+            win.clipboard_clear()
+            win.clipboard_append(text.get("1.0", "end-1c"))
+
+        tk.Button(bar, text="Copy all", command=copy).pack(side="left")
+        if path:
+            tk.Button(bar, text="Open file", command=lambda: open_path(path)).pack(
+                side="left", padx=6)
+            tk.Label(bar, text=str(path), anchor="w", fg="#777").pack(side="left", padx=6)
+        tk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        win.lift()
+        win.focus_force()
+
+    def _pick_file(self) -> None:
+        from tkinter import filedialog
+
+        paths = filedialog.askopenfilenames(title="Choose audio files to transcribe",
+                                            filetypes=AUDIO_TYPES)
+        if paths:
+            self.app.post(lambda: self.app.import_files(paths))
 
     def _pill(self, fill: str) -> None:
         c, w, h = self.canvas, self.W, self.H
@@ -1207,7 +1279,8 @@ class App:
         return [(s.start, s.end, s.speaker) for s in box["r"].segments]
 
     def process_call(self, wav: Path, started: datetime, duration: float,
-                     recovered: bool = False) -> None:
+                     recovered: bool = False, source: str | None = None,
+                     keep_busy: bool = False) -> None:
         t0 = time.monotonic()
         try:
             self.ui("call_transcribing")
@@ -1240,34 +1313,84 @@ class App:
             if turns is None:
                 turns = group_lines(units, word_level)
 
-            md = build_markdown(started, duration, turns, labelled, self.rules, recovered)
-            path = self._save_transcript(started, md)
-            self._dispose_wav(wav, path)
+            md = build_markdown(started, duration, turns, labelled, self.rules, recovered, source)
+            path = self._save_transcript(started, md, source)
+            self._dispose_wav(wav, path, source)
             self.last_transcript = path
             log.info("call: saved %s (labelled=%s) total %.1fs", path.name, labelled,
                      time.monotonic() - t0)
-            self.notify("Call transcript saved", path.name, path)
+            self.notify("Transcript saved", path.name, path)
+            if source and self.widget:
+                self.widget.q.put(("text", f"Transcript: {source}", md, path))
         except Exception:
             log.exception("call processing failed; audio kept at %s", wav)
-            self.notify("PyKeet", f"Call transcription failed. Audio kept: {wav.name}")
+            if source:  # the original file is untouched; drop our decoded copy
+                wav.unlink(missing_ok=True)
+                self.notify("PyKeet", f"Could not transcribe {source}. See pykeet.log.")
+            else:
+                self.notify("PyKeet", f"Call transcription failed. Audio kept: {wav.name}")
+        finally:
+            if not keep_busy:
+                self._set_idle()
+            self.ui("hidden")
+
+    # -- audio file import ----------------------------------------------------------
+    def request_file_picker(self) -> None:
+        if self.ready and self.mode == "idle" and self.widget:
+            self.widget.send("pick_file")  # the dialog must open on the tkinter thread
+        else:
+            self.notify("PyKeet", "Busy or still loading. Try again in a moment.")
+
+    def import_files(self, paths) -> None:
+        with self.lock:
+            if not self.ready or self.mode != "idle":
+                return
+            self.mode, self.phase = "call", "processing"  # blocks recording meanwhile
+        threading.Thread(target=self._import_worker, args=(list(paths),), daemon=True).start()
+
+    def _import_worker(self, paths) -> None:
+        try:
+            TMP_DIR.mkdir(exist_ok=True)
+            for i, raw in enumerate(paths):
+                src = Path(raw)
+                wav = TMP_DIR / f"import_{datetime.now():%Y%m%d_%H%M%S}_{i}.wav"
+                try:
+                    self.ui("call_transcribing")
+                    duration = decode_to_wav(src, wav)
+                except Exception:
+                    log.exception("could not read audio file %s", src.name)
+                    wav.unlink(missing_ok=True)
+                    self.notify("PyKeet", f"Could not read {src.name}. Is it a valid audio file?")
+                    continue
+                if duration < 1:
+                    wav.unlink(missing_ok=True)
+                    self.notify("PyKeet", f"{src.name} has no audio.")
+                    continue
+                try:
+                    started = datetime.fromtimestamp(src.stat().st_mtime)
+                except OSError:
+                    started = datetime.now()
+                log.info("importing %s (%.0fs)", src.name, duration)
+                self.process_call(wav, started, duration, source=src.name, keep_busy=True)
         finally:
             self._set_idle()
             self.ui("hidden")
 
-    def _save_transcript(self, started: datetime, md: str) -> Path:
+    def _save_transcript(self, started: datetime, md: str, source: str | None = None) -> Path:
         folder = Path(os.path.expanduser(self.cfg["transcript_folder"]))
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{started:%Y-%m-%d_%H%M}_call.md"
+        tag = re.sub(r"[^\w.-]+", "_", Path(source).stem)[:40] if source else "call"
+        path = folder / f"{started:%Y-%m-%d_%H%M}_{tag}.md"
         n = 2
         while path.exists():
-            path = folder / f"{started:%Y-%m-%d_%H%M}_call_{n}.md"
+            path = folder / f"{started:%Y-%m-%d_%H%M}_{tag}_{n}.md"
             n += 1
         path.write_text(md, encoding="utf-8")
         return path
 
-    def _dispose_wav(self, wav: Path, transcript: Path) -> None:
+    def _dispose_wav(self, wav: Path, transcript: Path, source: str | None = None) -> None:
         try:
-            if self.cfg["keep_audio"]:
+            if self.cfg["keep_audio"] and not source:
                 shutil.move(str(wav), str(transcript.with_suffix(".wav")))
             else:
                 wav.unlink(missing_ok=True)
@@ -1321,6 +1444,8 @@ class App:
 
         menu = pystray.Menu(
             pystray.MenuItem(call_label, lambda: self.post(self.toggle_call)),
+            pystray.MenuItem("Transcribe audio file…",
+                             lambda: self.post(self.request_file_picker)),
             pystray.MenuItem("Pause dictation", self._toggle_pause,
                              checked=lambda _i: self.paused),
             pystray.MenuItem("Show last transcript", lambda: self.post(self.show_last)),
