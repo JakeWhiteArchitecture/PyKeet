@@ -53,6 +53,8 @@ dictation_shortcut = "ctrl+space"
 recall_shortcut = "f8"
 cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
+# Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
+import_shortcut = "ctrl+alt+o"
 
 # "push" = hold to talk, "toggle" = press to start, press to stop
 dictation_mode = "push"
@@ -99,6 +101,7 @@ DEFAULTS = {
     "recall_shortcut": "f8",
     "cancel_shortcut": "esc",
     "call_shortcut": "ctrl+alt+r",
+    "import_shortcut": "ctrl+alt+o",
     "dictation_mode": "push",
     "model": "moondream/parakeet-redux",
     "call_model": "",
@@ -668,6 +671,7 @@ class Hotkeys:
         self.recall = parse_shortcut(cfg["recall_shortcut"])
         self.cancel = parse_shortcut(cfg["cancel_shortcut"])
         self.call = parse_shortcut(cfg["call_shortcut"])
+        self.importer = parse_shortcut(cfg["import_shortcut"])
         self.down: set[str] = set()
         self.last_press: dict[str, float] = {}
         self.ptt_active = False
@@ -693,6 +697,10 @@ class Hotkeys:
         mods, main = self.call
         if name == main and mods <= others:
             self.app.post(self.app.toggle_call)
+            return
+        mods, main = self.importer
+        if name == main and mods <= others:
+            self.app.post(self.app.request_file_picker)
             return
         mods, main = self.recall
         if name == main and mods <= others:

@@ -43,6 +43,7 @@ the first time, then fully offline); the tray shows "Ready." when it is done.
 | `F8` | Re-insert the last dictation |
 | `Esc` while recording | Discard |
 | `Ctrl+Alt+R` | Start / stop call recording |
+| `Ctrl+Alt+O` | Open the audio file picker (same as the tray item) |
 
 Widget: click while dictating = stop and insert, right-click = cancel. It is draggable and remembers its
 position. During a call it shows "CALL" and ignores clicks; stop with the shortcut or the tray menu.
@@ -63,7 +64,7 @@ first time you record a call).
 
 ## Transcribing an audio file
 
-Tray menu > **Transcribe audio file…** opens a file picker for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
+Tray menu > **Transcribe audio file…** (or `Ctrl+Alt+O`, handy if your desktop has no tray) opens a file picker for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
 several to batch them). Each file is decoded to 16 kHz mono, transcribed with the call settings
 (speaker labelling included, same fallbacks), and saved in your transcript folder as
 `YYYY-MM-DD_HHMM_<filename>.md`. When it finishes, a **text window** shows the transcript with
