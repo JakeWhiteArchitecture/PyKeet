@@ -120,6 +120,14 @@ file can't be read, a window shows the exact reason.
   `pip install spacy` then `python -m spacy download en_core_web_md` (use `en_core_web_sm` for the
   12 MB version). PyKeet uses it automatically (`use_ner = true`) and falls back to the simple rules if
   it is missing. It is still a statistical guess and will occasionally mislabel something.
+- **Decisions and tasks.** The viewer underlines sentences about a decision to make (amber), options
+  (magenta), a decision made (green), a task to do (blue) and a task done (grey), and "Action summary"
+  lists them all by type with their timestamps. By default this uses simple phrase rules (English):
+  good on clear wording ("we've decided to go with larch", "I'll send the drawings"), poor on natural
+  speech ("so yeah we'll go larch"). For better results set `action_model` in `config.toml` to a small
+  zero-shot AI model, e.g. `MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33` (needs
+  `pip install transformers`; downloads once; runs in the background after the viewer opens, with the
+  rules shown straight away). Treat both as a guide, not minutes: always check against the transcript.
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 

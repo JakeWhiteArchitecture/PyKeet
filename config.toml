@@ -50,6 +50,17 @@ dictation_silence_threshold_db = 0    # 0 = automatic (adapts to your room noise
 # Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
 highlight_names = []
 highlight_companies = []
+# Mark sentences about decisions and tasks in the transcript viewer (underlined in colour):
+# decisions to make, options, decisions made, tasks to do, tasks done. Phrase-matching
+# rules (English), so it is a rough guide, not understanding. Plus an "Action summary" view.
+highlight_actions = true
+# Optional: a small AI model that reads each sentence for its meaning, much better than the
+# phrase rules on natural speech. Empty = rules only. Needs `pip install transformers` (uses the
+# PyTorch you already have) and downloads the model once (~100-300 MB). Try, in order of size:
+#   "MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33"   (tiny)
+#   "typeform/distilbert-base-uncased-mnli"                    (bigger, well known)
+# Analysis runs in the background after the viewer opens; the rules show straight away.
+action_model = ""
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true

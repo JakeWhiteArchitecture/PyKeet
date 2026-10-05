@@ -31,7 +31,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "0.8"
+VERSION = "0.9"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -102,6 +102,17 @@ dictation_silence_threshold_db = 0    # 0 = automatic (adapts to your room noise
 # Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
 highlight_names = []
 highlight_companies = []
+# Mark sentences about decisions and tasks in the transcript viewer (underlined in colour):
+# decisions to make, options, decisions made, tasks to do, tasks done. Phrase-matching
+# rules (English), so it is a rough guide, not understanding. Plus an "Action summary" view.
+highlight_actions = true
+# Optional: a small AI model that reads each sentence for its meaning, much better than the
+# phrase rules on natural speech. Empty = rules only. Needs `pip install transformers` (uses the
+# PyTorch you already have) and downloads the model once (~100-300 MB). Try, in order of size:
+#   "MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33"   (tiny)
+#   "typeform/distilbert-base-uncased-mnli"                    (bigger, well known)
+# Analysis runs in the background after the viewer opens; the rules show straight away.
+action_model = ""
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true
@@ -143,6 +154,8 @@ DEFAULTS = {
     "highlight_names": [],
     "highlight_companies": [],
     "use_ner": True,
+    "highlight_actions": True,
+    "action_model": "",
     "ner_model": "en_core_web_md",
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
@@ -565,7 +578,180 @@ def find_entities(text: str, names=(), companies=(), ner: bool = False
     return sorted(taken)
 
 
-def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bool = False):
+ACTION_COLOURS = {  # underline colours (entities use background colours, so both can show)
+    "decision_open": "#e08a00", "option": "#c026d3", "decision_made": "#15803d",
+    "task_open": "#2563eb", "task_done": "#6b7280",
+}
+ACTION_LABELS = {"decision_open": "Decision to make", "option": "Options",
+                 "decision_made": "Decision made", "task_open": "Task to do",
+                 "task_done": "Task done"}
+
+SUMMARY_HEADINGS = {"decision_open": "Decisions to be made", "option": "Decision options available",
+                    "decision_made": "Decisions made", "task_open": "Tasks to be done",
+                    "task_done": "Tasks done"}
+
+_R = re.IGNORECASE
+_PEOPLE = r"(?:i|we|you|he|she|they)"
+_ACTION_RULES: list[tuple[str, re.Pattern]] = [  # first match wins, in this order
+    ("decision_made", re.compile(
+        r"\bwe(?:['’]ve| have)? (?:decided|agreed|settled|chosen|opted)\b"
+        r"|\b" + _PEOPLE + r"(?:['’]ll| will|['’]re going to| are going to| am going to|['’]m going to)"
+        r" go (?:with|for)\b"
+        r"|\blet['’]?s (?:go (?:with|for)|use|stick with|do it|run with|proceed with)\b"
+        r"|\b(?:that['’]?s|it['’]?s|this is) (?:agreed|settled|decided|confirmed|approved)\b"
+        r"|\bthe decision (?:is|was) (?:to|made)\b|\b(?:sticking|going) with\b"
+        r"|\bfinal (?:decision|choice)\b|\bsigned off\b|\bwe(?:['’]re| are) (?:going )?ahead with\b",
+        _R)),
+    ("task_done", re.compile(
+        r"\b" + _PEOPLE + r"(?:['’]ve| have| had)? (?:already |just |now |also )?"
+        r"(?:sent|submitted|emailed|finished|completed|issued|booked|arranged|ordered|paid|filed|"
+        r"uploaded|updated|fixed|signed|prepared|checked|chased|called|rung|posted|installed|"
+        r"delivered|dealt with|sorted|done)\b"
+        r"|\b(?:it['’]?s|that['’]?s|they['’]?re|all) (?:done|sorted|finished|complete|completed|"
+        r"submitted|booked|ordered|paid)\b"
+        r"|\b(?:has|have|had) been (?:sent|submitted|done|completed|issued|booked|ordered|paid)\b"
+        r"|\bwas (?:sent|submitted|issued|completed|done)\b", _R)),
+    ("option", re.compile(
+        r"\boption\s+(?:[abc]|one|two|three|\d)\b"
+        r"|\b(?:another|other|one|an|first|second|two|three)\s+(?:option|choice|alternative|way)s?\b"
+        r"|\balternatively\b|\beither\b[^.?!]*\bor\b"
+        r"|\b(?:could|can|might|may)\b[^.?!]*\bor (?:we|you|i)\s+(?:could|can|might|may)\b"
+        r"|\bon the other hand\b", _R)),
+    ("decision_open", re.compile(
+        r"\b" + _PEOPLE + r" (?:still )?(?:need|have|got|must|should) to (?:decide|choose|pick|"
+        r"settle|determine|agree|confirm which)\b"
+        r"|\b(?:need|needs|needing) (?:a )?decision\b|\bshould we\b|\bshall we\b"
+        r"|\bwhich (?:one|option|way|of)\b|\bwhether (?:to|or not)\b"
+        r"|\b(?:not|isn['’]?t|un)sure (?:if|whether|about|which)\b"
+        r"|\b(?:haven['’]?t|have not) (?:decided|chosen|agreed)\b|\byet to (?:decide|be decided)\b"
+        r"|\bto be decided\b|\bup in the air\b|\bup to you\b|\byour call\b", _R)),
+    ("task_open", re.compile(
+        r"\b" + _PEOPLE + r"(?:['’]ll| will| shall|['’]re going to| are going to|['’]m going to|"
+        r" am going to) (?!decide)\w+"
+        r"|\b" + _PEOPLE + r" (?:need|needs|have|has|must|should|ought) to (?!decide|choose)\w+"
+        r"|\b(?:can|could|would|will) you (?:please )?\w+|\bplease (?:send|make sure|let me|"
+        r"update|check|arrange|book|call|email|chase|prepare|issue|confirm|can|could)\b"
+        r"|\b(?:action point|to-?do|follow[- ]?up)\b|\bremind (?:me|us|you)\b|\bmake sure\b"
+        r"|\bdon['’]?t forget\b", _R)),
+]
+_SENTENCE = re.compile(r"[^.?!]+[.?!]*")
+
+
+_MODEL_KINDS: dict[str, str | None] = {}  # sentence -> kind decided by rules + AI model
+_ACTION_MODELS: dict[str, "ActionModel | None"] = {}
+ACTION_MODEL_LABELS = {
+    "decision_open": "a decision that still has to be made",
+    "option": "options or alternatives to choose between",
+    "decision_made": "a decision that has been made",
+    "task_open": "a task that someone has to do",
+    "task_done": "a task that has already been done",
+    None: "small talk or something else",
+}
+
+
+class ActionModel:
+    """Zero-shot sentence classifier (small NLI model via transformers). Optional."""
+
+    def __init__(self, name: str):
+        from transformers import pipeline  # ImportError if not installed
+
+        self.pipe = pipeline("zero-shot-classification", model=name, device=-1)
+        self.keys = list(ACTION_MODEL_LABELS)
+        self.labels = list(ACTION_MODEL_LABELS.values())
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        res = self.pipe(sentences, candidate_labels=self.labels,
+                        hypothesis_template="This is {}.", batch_size=16)
+        if isinstance(res, dict):
+            res = [res]
+        return [(self.keys[self.labels.index(r["labels"][0])], float(r["scores"][0]))
+                for r in res]
+
+
+def get_action_model(name: str):
+    if name not in _ACTION_MODELS:
+        try:
+            _ACTION_MODELS[name] = ActionModel(name)
+            log.info("action detection: using model %s", name)
+        except Exception as exc:
+            log.warning("action detection: could not load %s (%s: %s); using rules",
+                        name, type(exc).__name__, exc)
+            _ACTION_MODELS[name] = None
+    return _ACTION_MODELS[name]
+
+
+def combine_kind(rule_kind: str | None, model_kind: str | None, score: float) -> str | None:
+    """A confident model answer wins; a confident 'neither' removes a rule match; otherwise
+    fall back to the phrase rules."""
+    if model_kind is not None and score >= 0.5:
+        return model_kind
+    if model_kind is None and score >= 0.75:
+        return None
+    return rule_kind
+
+
+def transcript_sentences(md: str) -> list[str]:
+    out = []
+    for line in md.split("\n"):
+        m = re.match(r"^\[\d+:\d\d(?::\d\d)?\]\s*(?:\*\*.+?:\*\*)?\s*(.*)$", line)
+        if m:
+            out += [x.group().strip() for x in _SENTENCE.finditer(m.group(1))
+                    if len(x.group().split()) >= 4]
+    return out
+
+
+def analyse_actions(md: str, model) -> None:
+    """Run the AI model over every sentence once and remember the combined verdicts."""
+    todo = [x for x in dict.fromkeys(transcript_sentences(md)) if x not in _MODEL_KINDS]
+    for i in range(0, len(todo), 32):
+        chunk = todo[i:i + 32]
+        for sent, (mk, score) in zip(chunk, model.predict(chunk)):
+            _MODEL_KINDS[sent] = combine_kind(classify_sentence(sent), mk, score)
+
+
+def classify_sentence(sentence: str) -> str | None:
+    """Decision/task type of one sentence, or None. Phrase rules, English only."""
+    for kind, pat in _ACTION_RULES:
+        if pat.search(sentence):
+            return kind
+    return None
+
+
+def find_actions(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, kind) for each sentence of `text` that is about a decision or a task."""
+    out = []
+    for m in _SENTENCE.finditer(text):
+        sent = m.group()
+        if len(sent.split()) < 3:
+            continue
+        key = sent.strip()
+        kind = _MODEL_KINDS[key] if key in _MODEL_KINDS else classify_sentence(sent)
+        if kind:
+            out.append((m.start() + (len(sent) - len(sent.lstrip())), m.end(), kind))
+    return out
+
+
+def action_summary(md: str) -> str:
+    """Markdown list of every decision / option / task sentence in a transcript, by type."""
+    groups: dict[str, list[str]] = {k: [] for k in ACTION_LABELS}
+    for line in md.split("\n"):
+        m = re.match(r"^(\[\d+:\d\d(?::\d\d)?\])\s*(?:\*\*(.+?):\*\*)?\s*(.*)$", line)
+        if not m:
+            continue
+        ts, who, text = m.groups()
+        for a, b, kind in find_actions(text):
+            groups[kind].append(f"- {ts} " + (f"**{who}:** " if who else "") + text[a:b].strip())
+    out = ["# Action summary", ""]
+    for kind in ("decision_open", "option", "decision_made", "task_open", "task_done"):
+        out.append(f"## {SUMMARY_HEADINGS[kind]}")
+        out += groups[kind] or ["- (none found)"]
+        out.append("")
+    out.append("Found automatically: check against the transcript, some will be missed or wrong.")
+    return "\n".join(out)
+
+
+def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bool = False,
+                actions: bool = False):
     """Turn Markdown into [(text, tags)] for a Tk Text widget.
 
     Handles # / ## headings, '- ' bullets, **bold**, leading [mm:ss] timestamps, and (for
@@ -593,6 +779,12 @@ def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bo
             plain += txt
             bold += [is_b] * len(txt)
         kinds = [None] * len(plain)
+        acts = [None] * len(plain)
+        if highlight and actions and not bullet and plain.strip():
+            detect_a = "".join(" " if bold[k] else plain[k] for k in range(len(plain)))
+            for a, b, kind in find_actions(detect_a):
+                for i in range(a, min(b, len(plain))):
+                    acts[i] = kind
         if highlight and not bullet and plain.strip():
             # bold text (the "Speaker 1:" label) is hidden from detection
             detect = "".join(" " if bold[k] else plain[k] for k in range(len(plain)))
@@ -602,9 +794,11 @@ def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bo
         i = 0
         while i < len(plain):
             j = i
-            while j < len(plain) and bold[j] == bold[i] and kinds[j] == kinds[i]:
+            while (j < len(plain) and bold[j] == bold[i] and kinds[j] == kinds[i]
+                   and acts[j] == acts[i]):
                 j += 1
-            tags = (("bold",) if bold[i] else ()) + ((kinds[i],) if kinds[i] else ())
+            tags = ((("bold",) if bold[i] else ()) + ((kinds[i],) if kinds[i] else ())
+                    + ((acts[i],) if acts[i] else ()))
             out.append((plain[i:j], tags))
             i = j
         out.append(("\n", ()))
@@ -1442,6 +1636,7 @@ class Widget:
         win = tk.Toplevel(self.root)
         win.title(title)
         win.geometry("820x620")
+        win_font = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
         bar = tk.Frame(win)
         bar.pack(side="bottom", fill="x", padx=8, pady=6)
         if markdown:  # colour legend
@@ -1451,9 +1646,15 @@ class Widget:
             for kind, colour in ENTITY_COLOURS.items():
                 tk.Label(legend, text=ENTITY_LABELS[kind], bg=colour, fg="#111",
                          padx=6).pack(side="left", padx=3)
+            if self.app.cfg.get("highlight_actions"):
+                legend2 = tk.Frame(win)
+                legend2.pack(side="bottom", fill="x", padx=8, pady=(2, 0))
+                tk.Label(legend2, text="Underlined:").pack(side="left")
+                for kind, colour in ACTION_COLOURS.items():
+                    tk.Label(legend2, text=ACTION_LABELS[kind], fg=colour, padx=6,
+                             font=(win_font, 10, "underline")).pack(side="left", padx=3)
         frame = tk.Frame(win)
         frame.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 4))
-        win_font = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
         text = tk.Text(frame, wrap="word", font=(win_font, 11), padx=10, pady=8, spacing3=4,
                        undo=False)
         scroll = tk.Scrollbar(frame, command=text.yview)
@@ -1467,36 +1668,82 @@ class Widget:
         text.tag_configure("bullet", foreground="#555555")
         for kind, colour in ENTITY_COLOURS.items():
             text.tag_configure(kind, background=colour, foreground="#111111")
+        for kind, colour in ACTION_COLOURS.items():
+            text.tag_configure(kind, underline=True, underlinefg=colour)
         text.tag_raise("sel")
-        showing_raw = {"on": not markdown}
+        showing = {"mode": "raw" if not markdown else "formatted"}
 
         def render():
             text.configure(state="normal")
             text.delete("1.0", "end")
-            if showing_raw["on"]:
+            cfg = self.app.cfg
+            if showing["mode"] == "raw":
                 text.insert("1.0", body)
+            elif showing["mode"] == "summary":
+                for chunk, tags in md_segments(action_summary(body), highlight=False):
+                    text.insert("end", chunk, tags)
             else:
-                cfg = self.app.cfg
                 for chunk, tags in md_segments(body, cfg.get("highlight_names") or (),
                                                cfg.get("highlight_companies") or (),
-                                               ner=bool(cfg.get("use_ner"))):
+                                               ner=bool(cfg.get("use_ner")),
+                                               actions=bool(cfg.get("highlight_actions"))):
                     text.insert("end", chunk, tags)
             text.configure(state="disabled")  # read-only, but selecting/copying still works
 
         def copy():
             win.clipboard_clear()
-            win.clipboard_append(body)
+            win.clipboard_append(action_summary(body) if showing["mode"] == "summary" else body)
 
-        def toggle():
-            showing_raw["on"] = not showing_raw["on"]
-            raw_btn.configure(text="Show formatted" if showing_raw["on"] else "Show raw Markdown")
+        def set_mode(mode):
+            showing["mode"] = "formatted" if showing["mode"] == mode else mode
+            raw_btn.configure(text="Show formatted" if showing["mode"] == "raw"
+                              else "Show raw Markdown")
+            sum_btn.configure(text="Show formatted" if showing["mode"] == "summary"
+                              else "Action summary")
             render()
 
         render()
+        status = tk.Label(win, text="", fg="#777", anchor="w")
+        model_name = str(self.app.cfg.get("action_model") or "")
+        if markdown and model_name and self.app.cfg.get("highlight_actions"):
+            status.pack(side="bottom", fill="x", padx=10)
+            status.configure(text="Analysing decisions and tasks with the AI model "
+                                  "(the first time it downloads the model)…")
+            results: queue.Queue = queue.Queue()
+
+            def work():
+                try:
+                    model = get_action_model(model_name)
+                    if model is None:
+                        raise RuntimeError("model could not be loaded; see pykeet.log")
+                    analyse_actions(body, model)
+                    results.put(None)
+                except Exception as exc:
+                    log.exception("action analysis failed")
+                    results.put(exc)
+
+            def poll():
+                if not win.winfo_exists():
+                    return
+                try:
+                    res = results.get_nowait()
+                except queue.Empty:
+                    win.after(300, poll)
+                    return
+                if res is None:
+                    status.configure(text="AI analysis done.")
+                    render()
+                else:
+                    status.configure(text=f"AI model unavailable ({res}); showing the phrase rules.")
+
+            threading.Thread(target=work, daemon=True).start()
+            win.after(300, poll)
         tk.Button(bar, text="Copy all", command=copy).pack(side="left")
-        raw_btn = tk.Button(bar, text="Show raw Markdown", command=toggle)
+        raw_btn = tk.Button(bar, text="Show raw Markdown", command=lambda: set_mode("raw"))
+        sum_btn = tk.Button(bar, text="Action summary", command=lambda: set_mode("summary"))
         if markdown:
             raw_btn.pack(side="left", padx=6)
+            sum_btn.pack(side="left", padx=0)
         if path:
             tk.Button(bar, text="Open file", command=lambda: open_path(path)).pack(
                 side="left", padx=6)

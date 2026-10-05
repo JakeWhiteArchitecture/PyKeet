@@ -10,3 +10,5 @@ diarize
 # Smarter name / company / place highlighting in the transcript viewer (small, ~100 MB).
 # After installing, also run:  python -m spacy download en_core_web_md
 spacy
+# Optional, for the AI decision/task detector (config: action_model). Uses the PyTorch you have.
+# transformers
