@@ -690,7 +690,11 @@ class Hotkeys:
         others = self.down - {name}
 
         mods, main = self.dictation
+        if name == main and mods <= others and not self.app.dictation_enabled:
+            log.info("dictation hotkey seen but ignored (ready=%s paused=%s mode=%s)",
+                     self.app.ready, self.app.paused, self.app.mode)
         if name == main and mods <= others and self.app.dictation_enabled:
+            log.info("hotkey: dictation")
             self.ptt_active = True
             self.app.post(self.app.on_dictation_press)
             return
@@ -722,6 +726,8 @@ class Hotkeys:
     def _on_press(self, key):
         n = key_name(key)
         if n:
+            if self.app.cfg["debug"]:
+                log.debug("key down: %s (held: %s)", n, sorted(self.down))
             self.press(n)
 
     def _on_release(self, key):
@@ -773,6 +779,7 @@ class Hotkeys:
         return chr(vk).lower()
 
     def start(self) -> None:
+        log.info("session type: %s", os.environ.get("XDG_SESSION_TYPE", "unknown"))
         if os.environ.get("XDG_SESSION_TYPE") == "wayland":
             log.warning("Wayland session: global hotkeys will not work. Use an X11 session.")
         try:
@@ -933,7 +940,10 @@ class Widget:
         else:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
+            self.root.lift()
             self._draw()
+            self.root.update_idletasks()
+        log.info("widget state: %s", state)
 
     def _show_text(self, title: str, body: str, path) -> None:
         """Result window: scrollable transcript with Copy / Open file buttons."""
