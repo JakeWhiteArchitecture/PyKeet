@@ -7,3 +7,6 @@ soundfile
 scipy
 # Speaker labels in call transcripts (large: pulls in PyTorch)
 diarize
+# Smarter name / company / place highlighting in the transcript viewer (small, ~100 MB).
+# After installing, also run:  python -m spacy download en_core_web_md
+spacy

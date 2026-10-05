@@ -31,7 +31,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "0.5"
+VERSION = "0.6"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -93,6 +93,12 @@ parallel_workers = true
 # Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
 highlight_names = []
 highlight_companies = []
+# Use a small name-recognition model (spaCy) for better names/places/companies in the
+# transcript viewer. Optional install, see README. Falls back to simple rules if missing.
+use_ner = true
+# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
+# install; the other is the fallback.
+ner_model = "en_core_web_md"
 --------------------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
@@ -123,6 +129,8 @@ DEFAULTS = {
     "parallel_workers": True,
     "highlight_names": [],
     "highlight_companies": [],
+    "use_ner": True,
+    "ner_model": "en_core_web_md",
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
     "call_model": "",
@@ -374,7 +382,7 @@ ENTITY_COLOURS = {  # soft backgrounds, readable with dark text
     "name": "#cfe3ff", "phone": "#c9f0d2", "address": "#ffe0b5",
     "company": "#e4d3ff", "email": "#c8f0f0",
 }
-ENTITY_LABELS = {"name": "Name / proper noun", "phone": "Phone", "address": "Address",
+ENTITY_LABELS = {"name": "Name / proper noun", "phone": "Phone", "address": "Address / place",
                  "company": "Company", "email": "Email"}
 
 _DIGIT_WORDS = r"(?:oh|zero|nought|one|two|three|four|five|six|seven|eight|nine|double|triple)"
@@ -414,6 +422,58 @@ _PROPER_STOP = _LEAD_STOP | {
     "duration", "source", "mr", "mrs", "ms", "miss", "dr"}
 
 
+_NLP = None
+_NLP_TRIED = False
+NER_MODELS = ["en_core_web_md", "en_core_web_sm"]  # best first; main() puts config's first
+_NER_KINDS = {"PERSON": "name", "ORG": "company", "GPE": "address", "LOC": "address",
+              "FAC": "address"}
+
+
+def get_ner():
+    """Small spaCy name-recognition model, loaded once. None if spaCy/model is missing."""
+    global _NLP, _NLP_TRIED
+    if _NLP_TRIED:
+        return _NLP
+    _NLP_TRIED = True
+    try:
+        import spacy
+    except ImportError:
+        log.info("name detection: spaCy is not installed; using simple rules. To enable: "
+                 "%s -m pip install spacy && %s -m spacy download en_core_web_md",
+                 sys.executable, sys.executable)
+        return None
+    for name in NER_MODELS:
+        try:
+            _NLP = spacy.load(name, exclude=["parser", "lemmatizer", "attribute_ruler",
+                                             "senter"])
+            log.info("name detection: using spaCy %s", name)
+            return _NLP
+        except Exception:
+            continue
+    log.info("name detection: no spaCy model found; using simple rules. To enable: "
+             "%s -m spacy download en_core_web_md", sys.executable)
+    return None
+
+
+def ner_spans(text: str) -> list[tuple[int, int, str]]:
+    nlp = get_ner()
+    if nlp is None or not text.strip():
+        return []
+    out = []
+    for e in nlp(text).ents:
+        kind = _NER_KINDS.get(e.label_)
+        if not kind:
+            continue
+        a, b = e.start_char, e.end_char
+        while b > a and text[b - 1] in ".,;:!?'\"":  # "Part L." -> "Part L"
+            b -= 1
+        words = text[a:b].split()
+        if not words or words[0].lower() in _PROPER_STOP or text[a:b].lower() in _PROPER_STOP:
+            continue  # "Part L", "Monday", "Hello" are not names
+        out.append((a, b, kind))
+    return out
+
+
 def _sentence_start(text: str, i: int) -> bool:
     j = i - 1
     while j >= 0 and text[j] in " \t*\"'(":
@@ -421,11 +481,13 @@ def _sentence_start(text: str, i: int) -> bool:
     return j < 0 or text[j] in ".?!:"
 
 
-def find_entities(text: str, names=(), companies=()) -> list[tuple[int, int, str]]:
+def find_entities(text: str, names=(), companies=(), ner: bool = False
+                  ) -> list[tuple[int, int, str]]:
     """Heuristic spans (start, end, kind) for names, phones, addresses, companies, emails.
 
-    No language model involved, so it is a best guess: add people/firms you deal with to
-    `highlight_names` / `highlight_companies` in config.toml to have them always marked.
+    Rules plus (optionally, `ner=True`) a tiny spaCy name-recognition model. Still a best
+    guess: add people/firms you deal with to `highlight_names` / `highlight_companies` in
+    config.toml to have them always marked.
     """
     cands: list[tuple[int, int, int, str]] = []  # (priority, start, end, kind)
 
@@ -458,7 +520,12 @@ def find_entities(text: str, names=(), companies=()) -> list[tuple[int, int, str
             add(3, a, b, "company")
     for m in _NAME_CUE.finditer(text):
         add(4, m.start("n"), m.end("n"), "name")
-    # generic proper nouns in the middle of a sentence (the model capitalises names)
+    use_ner = ner and get_ner() is not None
+    if use_ner:
+        for a, b, kind in ner_spans(text):
+            add(3, a, b, kind)
+    # generic proper nouns in the middle of a sentence (the model capitalises names);
+    # only needed when there is no name-recognition model
     run: list[re.Match] = []
 
     def flush():
@@ -466,7 +533,7 @@ def find_entities(text: str, names=(), companies=()) -> list[tuple[int, int, str
             add(5, run[0].start(), run[-1].end(), "name")
             run.clear()
 
-    for m in _CAP_WORD.finditer(text):
+    for m in ([] if use_ner else _CAP_WORD.finditer(text)):
         w = m.group()
         if w.lower() in _PROPER_STOP or _sentence_start(text, m.start()):
             flush()
@@ -483,7 +550,7 @@ def find_entities(text: str, names=(), companies=()) -> list[tuple[int, int, str
     return sorted(taken)
 
 
-def md_segments(md: str, names=(), companies=(), highlight: bool = True):
+def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bool = False):
     """Turn Markdown into [(text, tags)] for a Tk Text widget.
 
     Handles # / ## headings, '- ' bullets, **bold**, leading [mm:ss] timestamps, and (for
@@ -512,7 +579,9 @@ def md_segments(md: str, names=(), companies=(), highlight: bool = True):
             bold += [is_b] * len(txt)
         kinds = [None] * len(plain)
         if highlight and not bullet and plain.strip():
-            for a, b, kind in find_entities(plain, names, companies):
+            # bold text (the "Speaker 1:" label) is hidden from detection
+            detect = "".join(" " if bold[k] else plain[k] for k in range(len(plain)))
+            for a, b, kind in find_entities(detect, names, companies, ner):
                 for i in range(a, b):
                     kinds[i] = kind
         i = 0
@@ -1280,7 +1349,8 @@ class Widget:
             else:
                 cfg = self.app.cfg
                 for chunk, tags in md_segments(body, cfg.get("highlight_names") or (),
-                                               cfg.get("highlight_companies") or ()):
+                                               cfg.get("highlight_companies") or (),
+                                               ner=bool(cfg.get("use_ner"))):
                     text.insert("end", chunk, tags)
             text.configure(state="disabled")  # read-only, but selecting/copying still works
 
@@ -1958,6 +2028,7 @@ def check_dependencies() -> None:
         ("optional (tray icon + file picker)", [("pystray", "pystray"), ("PIL", "Pillow")]),
         ("optional (audio file import)", [("soundfile", "soundfile"), ("scipy", "scipy")]),
         ("optional (speaker labels)", [("diarize", "diarize")]),
+        ("optional (smarter name highlighting)", [("spacy", "spacy")]),
     ]
     for label, mods in groups:
         missing = [pkg for mod, pkg in mods if importlib.util.find_spec(mod) is None]
@@ -1978,6 +2049,7 @@ def main() -> None:
                  "shortcut, giving double dialogs and double pastes.\n"
                  "Close the other one first, e.g.:  pkill -f main.py")
     load_speeds()
+    NER_MODELS[:] = [cfg["ner_model"]] + [n for n in NER_MODELS if n != cfg["ner_model"]]
     try:
         import tkinter  # noqa: F401
     except ImportError:

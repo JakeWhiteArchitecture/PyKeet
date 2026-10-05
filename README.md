@@ -103,6 +103,12 @@ file can't be read, a window shows the exact reason.
   rule-based guesswork, not AI: it will miss some and mark some places or products as names. Add anyone
   or any firm you want always marked to `highlight_names` / `highlight_companies` in `config.toml`.
   "Show raw Markdown" and "Copy all" give you the plain text.
+- **Smarter name detection (optional).** With a small name-recognition model (spaCy, about 40 MB, runs in
+  milliseconds on CPU, no GPU or big LLM needed) the viewer finds people, companies and places much
+  better than the built-in rules, including unusual names at the start of a sentence. Install it once:
+  `pip install spacy` then `python -m spacy download en_core_web_md` (use `en_core_web_sm` for the
+  12 MB version). PyKeet uses it automatically (`use_ner = true`) and falls back to the simple rules if
+  it is missing. It is still a statistical guess and will occasionally mislabel something.
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
