@@ -92,11 +92,15 @@ file can't be read, a window shows the exact reason.
   *estimate* from the audio length and how fast your machine has actually been (it learns from each
   job and stores that in `speeds.json`), so the first job may be a little off. It holds at 99% until
   the work really finishes.
-- **Dictation while a call transcribes.** With `parallel_workers = true` (default) a second copy of
-  the model does the call/file work, so `Ctrl+Space` dictation keeps working. Costs extra RAM (about
-  one more model) and both share your CPU, so each runs somewhat slower while they overlap. Set it to
-  `false` to use one model; dictation then waits until the call is done. Only one call/file job runs at
-  a time; start another when the pill disappears.
+- **Several call jobs at once, dictation always one at a time.** `call_workers = 2` (default) lets two
+  call / audio-file transcriptions run at the same time, each on its own copy of the model; more jobs
+  wait in a queue (the pill says "Waiting for a free worker…", and "(3 jobs)" when several are going).
+  You can start the next call recording while earlier ones are still being transcribed, and
+  picking several files starts one job per file. Dictation has its own model and only ever runs one
+  dictation at a time, and it keeps working while call jobs run. The cost is RAM (about one more
+  model per worker) and your CPU is shared, so each job is slower while they overlap. Set
+  `call_workers = 1` for a single background job, or `0` to share the dictation model (dictation then
+  waits while a call job runs).
 - **Transcript viewer.** Imported files, and tray > Show last transcript, open a small Markdown viewer
   (headings, bold speaker names, grey timestamps). Names / proper nouns (blue), phone numbers (green),
   addresses and postcodes (orange), companies (purple) and emails (teal) are coloured. This is

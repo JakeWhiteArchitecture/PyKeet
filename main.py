@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +31,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "0.6"
+VERSION = "0.7"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -86,10 +86,11 @@ dictation_beep = false
 native_file_picker = true
 
 # --- Calls ---
-# Run call/file transcription on a second copy of the model, so dictation keeps working
-# while a call is being transcribed. Costs extra RAM and shares your CPU.
-# false = one model; dictation waits until the call is done.
-parallel_workers = true
+# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
+# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
+# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
+# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
+call_workers = 2
 # Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
 highlight_names = []
 highlight_companies = []
@@ -126,7 +127,7 @@ DEFAULTS = {
     "call_shortcut": "ctrl+alt+r",
     "import_shortcut": "ctrl+alt+o",
     "native_file_picker": True,
-    "parallel_workers": True,
+    "call_workers": 2,
     "highlight_names": [],
     "highlight_companies": [],
     "use_ner": True,
@@ -158,6 +159,8 @@ def load_config() -> dict:
     try:
         data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         cfg.update(data)
+        if data.get("parallel_workers") is False and "call_workers" not in data:
+            cfg["call_workers"] = 0  # old setting
     except Exception:
         print(f"Could not read {CONFIG_PATH}; using defaults.", file=sys.stderr)
         logging.getLogger("pykeet").exception("config read failed")
@@ -860,7 +863,9 @@ class Engine:
         self._locks: dict[int, threading.Lock] = {}  # one transcription at a time PER model copy
         self._open_lock = threading.Lock()
         self.main = None
-        self.call = None
+        self.workers: list = []          # extra model copies for call / file jobs
+        self._free: queue.Queue = queue.Queue()
+        self._open_failed = False
 
     def _open(self, model: str, device: str):
         import moondream as md
@@ -874,22 +879,39 @@ class Engine:
     def load(self) -> None:
         self.main = self._open(self.cfg["model"], self.cfg["device"])
 
-    def for_call(self):
-        """Model for background jobs. A separate copy (opened on first use) when parallel
-        workers are on or a different call_model is set; otherwise the main one."""
-        model = self.cfg["call_model"] or self.cfg["model"]
-        device = self.cfg["call_device"] or self.cfg["device"]
-        same = model == self.cfg["model"] and device == self.cfg["device"]
-        if same and not self.cfg["parallel_workers"]:
-            return self.main
+    @contextmanager
+    def call_worker(self):
+        """Borrow a model copy for one call/file job. Up to `call_workers` copies exist (opened
+        on first need); extra jobs wait here until one is free. With 0 workers the job shares
+        the dictation model."""
+        n = int(self.cfg["call_workers"])
+        if n <= 0:
+            yield self.main
+            return
+        speech = self._take_worker(n)
+        try:
+            yield speech
+        finally:
+            self._free.put(speech)
+
+    def _take_worker(self, n: int):
+        try:
+            return self._free.get_nowait()
+        except queue.Empty:
+            pass
         with self._open_lock:
-            if self.call is None:
+            if len(self.workers) < n and not self._open_failed:
+                model = self.cfg["call_model"] or self.cfg["model"]
+                device = self.cfg["call_device"] or self.cfg["device"]
                 try:
-                    self.call = self._open(model, device)
+                    speech = self._open(model, device)
                 except Exception:
-                    log.exception("second model copy failed to load; sharing the main model")
-                    self.call = self.main
-            return self.call
+                    log.exception("could not load another model copy; sharing the main model")
+                    self._open_failed = True
+                    speech = self.main
+                self.workers.append(speech)
+                return speech
+        return self._free.get()  # all copies busy: wait in the queue
 
     def transcribe(self, speech, **kwargs) -> dict:
         with self._locks.setdefault(id(speech), threading.Lock()):
@@ -1429,6 +1451,9 @@ class Widget:
         elif st == "call_preparing":
             dot("#ffb020")
             text(44, "Preparing…" + self.app.bg_note)
+        elif st == "call_queued":
+            dot("#8a8a92")
+            text(44, "Waiting for a free worker…" + self.app.bg_note)
         elif st in ("call_transcribing", "call_labelling"):
             dot("#ffb020")
             p = self.app.progress()
@@ -1475,15 +1500,15 @@ class App:
         self._call_started: datetime | None = None
         self._call_wav: Path | None = None
         self._quitting = False
-        # background job (call / file transcription), tracked separately from `mode` so
-        # dictation can carry on while it runs
-        self.bg_busy = False
+        # background jobs (call / file transcription): tracked separately from `mode` so dictation
+        # carries on, and several can run at once (see call_workers)
+        self.jobs: dict[int, dict] = {}
+        self._job_seq = 0
+        self._jobs_lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self.bg_phase: str | None = None
-        self.bg_kind = "transcribe"
-        self.bg_audio = 0.0
-        self.bg_started = 0.0
-        self.bg_expected = 1.0
         self.bg_note = ""
+        self._disp: dict | None = None   # the job the pill shows
         self._diarize_warm = False
         threading.Thread(target=self._action_loop, daemon=True).start()
 
@@ -1505,38 +1530,65 @@ class App:
         self._refresh_tray()
 
     @property
+    def bg_busy(self) -> bool:
+        return bool(self.jobs)
+
+    @property
     def dictation_enabled(self) -> bool:
         if not self.ready or self.paused or self.mode == "call":
             return False
-        return self.cfg["parallel_workers"] or not self.bg_busy
+        return self.cfg["call_workers"] > 0 or not self.bg_busy
 
-    # -- background job progress ------------------------------------------------
-    def bg_ui(self, phase: str | None) -> None:
-        self.bg_phase = phase
+    # -- background jobs ----------------------------------------------------------
+    def job_new(self, note: str = "") -> int:
+        with self._jobs_lock:
+            self._job_seq += 1
+            jid = self._job_seq
+            self.jobs[jid] = {"phase": "call_preparing", "kind": "transcribe", "audio": 0.0,
+                              "started": time.monotonic(), "expected": 1.0, "note": note}
+        self._bg_refresh()
+        return jid
+
+    def job_phase(self, jid: int, phase: str, audio: float = 0.0, kind: str | None = None):
+        job = self.jobs.get(jid)
+        if job is None:
+            return
+        job["phase"] = phase
+        if kind:
+            job.update(kind=kind, audio=audio, started=time.monotonic(),
+                       expected=max(4.0, audio / SPEEDS[kind]))
+        self._bg_refresh()
+
+    def job_end_phase(self, jid: int, record: bool = True) -> None:
+        job = self.jobs.get(jid)
+        if job and record:
+            update_speed(job["kind"], job["audio"], time.monotonic() - job["started"])
+
+    def job_done(self, jid: int) -> None:
+        with self._jobs_lock:
+            self.jobs.pop(jid, None)
+        self._bg_refresh()
+
+    def _bg_refresh(self) -> None:
+        """Pick which job the pill shows (oldest one doing real work) and tell the widget."""
+        with self._jobs_lock:
+            running = [(i, j) for i, j in sorted(self.jobs.items())
+                       if j["phase"] in ("call_transcribing", "call_labelling")]
+            pick = running[0] if running else next(iter(sorted(self.jobs.items())), None)
+            n = len(self.jobs)
+        self._disp = pick[1] if pick else None
+        self.bg_phase = self._disp["phase"] if self._disp else None
+        self.bg_note = (f" ({n} jobs)" if n > 1 else (self._disp["note"] if self._disp else ""))
         if self.widget:
-            self.widget.q.put(("bg", phase or "none"))
+            self.widget.q.put(("bg", self.bg_phase or "none"))
         self._refresh_tray()
 
-    def bg_begin(self, phase: str, audio_seconds: float, kind: str) -> None:
-        self.bg_kind, self.bg_audio = kind, audio_seconds
-        self.bg_started = time.monotonic()
-        self.bg_expected = max(4.0, audio_seconds / SPEEDS[kind])
-        self.bg_ui(phase)
-
-    def bg_end_phase(self, record: bool = True) -> None:
-        if record:
-            update_speed(self.bg_kind, self.bg_audio, time.monotonic() - self.bg_started)
-
-    def bg_done(self) -> None:
-        self.bg_busy = False
-        self.bg_note = ""
-        self.bg_ui(None)
-
     def progress(self) -> float | None:
-        """Estimated fraction done for the current phase (an estimate from audio length and
-        measured speed, capped at 99% until the phase really finishes)."""
-        if self.bg_phase in ("call_transcribing", "call_labelling"):
-            return min(0.99, (time.monotonic() - self.bg_started) / self.bg_expected)
+        """Estimated fraction done for the shown job's current phase (from audio length and
+        measured speed; held at 99% until the phase really finishes)."""
+        job = self._disp
+        if job and job["phase"] in ("call_transcribing", "call_labelling"):
+            return min(0.99, (time.monotonic() - job["started"]) / job["expected"])
         return None
 
     def _set_idle(self) -> None:
@@ -1588,11 +1640,11 @@ class App:
             if duration < 1:
                 wav.unlink(missing_ok=True)
                 continue
-            self.bg_busy = True
+            jid = self.job_new()
             try:
-                self.process_call(wav, started, duration, recovered=True, keep_busy=True)
+                self.process_call(wav, started, duration, jid, recovered=True)
             finally:
-                self.bg_done()
+                self.job_done(jid)
 
     # -- dictation --------------------------------------------------------------
     def on_dictation_press(self) -> None:
@@ -1685,15 +1737,11 @@ class App:
         if self.mode == "call" and self.phase == "recording":
             self.stop_call()
         elif self.mode == "idle":
-            if self.bg_busy:
-                self.notify("PyKeet", "Still transcribing the previous recording. "
-                            "Start the next call when that finishes.")
-                return
             self.start_call()
 
     def start_call(self) -> None:
         with self.lock:
-            if not self.ready or self.mode != "idle" or self.bg_busy:
+            if not self.ready or self.mode != "idle":
                 return
             TMP_DIR.mkdir(exist_ok=True)
             self._call_started = datetime.now()
@@ -1725,17 +1773,17 @@ class App:
         log.info("call: recording stopped after %.0fs", duration)
         wav, started = self._call_wav, self._call_started
         assert wav is not None and started is not None
-        self.bg_busy = True
-        self._set_idle()  # free for dictation while the call is transcribed
+        jid = self.job_new()
+        self._set_idle()  # free for dictation / the next call while this one is transcribed
         self.ui("hidden")
-        threading.Thread(target=self._process_call_job, args=(wav, started, duration),
+        threading.Thread(target=self._process_call_job, args=(jid, wav, started, duration),
                          daemon=True).start()
 
-    def _process_call_job(self, wav, started, duration) -> None:
+    def _process_call_job(self, jid, wav, started, duration) -> None:
         try:
-            self.process_call(wav, started, duration, keep_busy=True)
+            self.process_call(wav, started, duration, jid)
         finally:
-            self.bg_done()
+            self.job_done(jid)
 
     def run_diarize(self, wav: Path, duration: float):
         import diarize  # lazy: only loaded on first call-mode use
@@ -1759,18 +1807,17 @@ class App:
             raise box["e"]
         return [(s.start, s.end, s.speaker) for s in box["r"].segments]
 
-    def process_call(self, wav: Path, started: datetime, duration: float,
-                     recovered: bool = False, source: str | None = None,
-                     keep_busy: bool = False) -> None:
+    def process_call(self, wav: Path, started: datetime, duration: float, jid: int,
+                     recovered: bool = False, source: str | None = None) -> None:
         t0 = time.monotonic()
         try:
-            self.bg_ui("call_preparing")
             want_labels = bool(self.cfg["label_speakers"])
-            speech = self.engine.for_call()  # may load a second model copy the first time
-            self.bg_begin("call_transcribing", duration, "transcribe")
-            result = self.engine.transcribe(
-                speech, audio=str(wav), timestamps="word" if want_labels else "segment")
-            self.bg_end_phase()
+            self.job_phase(jid, "call_queued")  # waits here if every model copy is busy
+            with self.engine.call_worker() as speech:  # may load a model copy the first time
+                self.job_phase(jid, "call_transcribing", duration, "transcribe")
+                result = self.engine.transcribe(
+                    speech, audio=str(wav), timestamps="word" if want_labels else "segment")
+            self.job_end_phase(jid)
             units, word_level = extract_units(result)
             log.info("call: transcribed %.0fs in %.1fs (%d units)", duration,
                      time.monotonic() - t0, len(units))
@@ -1778,10 +1825,10 @@ class App:
             turns = None
             if want_labels and word_level and units:
                 try:
-                    self.bg_begin("call_labelling", duration, "diarize")
+                    self.job_phase(jid, "call_labelling", duration, "diarize")
                     t1 = time.monotonic()
                     segments = self.run_diarize(wav, duration)
-                    self.bg_end_phase(record=self._diarize_warm)  # 1st run includes model load
+                    self.job_end_phase(jid, record=self._diarize_warm)  # 1st run loads models
                     self._diarize_warm = True
                     if not segments:
                         raise RuntimeError("diarisation returned no segments")
@@ -1814,9 +1861,6 @@ class App:
                 self.notify("PyKeet", f"Could not transcribe {source}. See pykeet.log.")
             else:
                 self.notify("PyKeet", f"Call transcription failed. Audio kept: {wav.name}")
-        finally:
-            if not keep_busy:
-                self.bg_done()
 
     # -- audio file import ----------------------------------------------------------
     def show_text(self, title: str, body: str, path=None, markdown: bool = False) -> None:
@@ -1824,7 +1868,7 @@ class App:
             self.widget.q.put(("text", title, body, path, markdown))
 
     def request_file_picker(self) -> None:
-        if not (self.ready and self.mode == "idle" and not self.bg_busy and self.widget):
+        if not (self.ready and self.mode == "idle" and self.widget):
             self.notify("PyKeet", "Busy or still loading. Try again in a moment.")
             return
         cmd = native_picker_command() if self.cfg["native_file_picker"] else None
@@ -1855,56 +1899,57 @@ class App:
             self.post(lambda: self.import_files(paths))
 
     def import_files(self, paths) -> None:
-        with self.lock:
-            if not self.ready or self.mode != "idle" or self.bg_busy:
-                return
-            self.bg_busy = True  # one background job at a time; dictation stays available
-        threading.Thread(target=self._import_worker, args=(list(paths),), daemon=True).start()
+        """One background job per file; up to `call_workers` run at once, the rest queue."""
+        if not self.ready or self.mode != "idle":
+            return
+        paths = list(paths)
+        TMP_DIR.mkdir(exist_ok=True)
+        for i, raw in enumerate(paths):
+            note = f" ({i + 1}/{len(paths)})" if len(paths) > 1 else ""
+            threading.Thread(target=self._import_one, args=(i, raw, note), daemon=True).start()
 
-    def _import_worker(self, paths) -> None:
+    def _import_one(self, i: int, raw, note: str) -> None:
+        src = Path(raw)
+        jid = self.job_new(note)
+        wav = TMP_DIR / f"import_{datetime.now():%Y%m%d_%H%M%S}_{jid}.wav"
         try:
-            TMP_DIR.mkdir(exist_ok=True)
-            for i, raw in enumerate(paths):
-                src = Path(raw)
-                wav = TMP_DIR / f"import_{datetime.now():%Y%m%d_%H%M%S}_{i}.wav"
-                self.bg_note = f" ({i + 1}/{len(paths)})" if len(paths) > 1 else ""
-                try:
-                    self.bg_ui("call_preparing")
-                    duration = decode_to_wav(src, wav)
-                except Exception as exc:
-                    log.exception("could not read audio file %s", src.name)
-                    wav.unlink(missing_ok=True)
-                    if isinstance(exc, ImportError):
-                        why = (f"The package '{exc.name}' is not installed.\n\nRun this in the "
-                               f"terminal you start PyKeet from:\n{sys.executable} -m pip install "
-                               f"soundfile")
-                    else:
-                        why = f"{type(exc).__name__}: {exc}"
-                    self.show_text(f"Could not read {src.name}", why)
-                    continue
-                if duration < 1:
-                    wav.unlink(missing_ok=True)
-                    self.notify("PyKeet", f"{src.name} has no audio.")
-                    continue
-                try:
-                    started = datetime.fromtimestamp(src.stat().st_mtime)
-                except OSError:
-                    started = datetime.now()
-                log.info("importing %s (%.0fs)", src.name, duration)
-                self.process_call(wav, started, duration, source=src.name, keep_busy=True)
+            try:
+                duration = decode_to_wav(src, wav)
+            except Exception as exc:
+                log.exception("could not read audio file %s", src.name)
+                wav.unlink(missing_ok=True)
+                if isinstance(exc, ImportError):
+                    why = (f"The package '{exc.name}' is not installed.\n\nRun this in the "
+                           f"terminal you start PyKeet from:\n{sys.executable} -m pip install "
+                           f"soundfile")
+                else:
+                    why = f"{type(exc).__name__}: {exc}"
+                self.show_text(f"Could not read {src.name}", why)
+                return
+            if duration < 1:
+                wav.unlink(missing_ok=True)
+                self.notify("PyKeet", f"{src.name} has no audio.")
+                return
+            try:
+                started = datetime.fromtimestamp(src.stat().st_mtime)
+            except OSError:
+                started = datetime.now()
+            log.info("importing %s (%.0fs)", src.name, duration)
+            self.process_call(wav, started, duration, jid, source=src.name)
         finally:
-            self.bg_done()
+            self.job_done(jid)
 
     def _save_transcript(self, started: datetime, md: str, source: str | None = None) -> Path:
         folder = Path(os.path.expanduser(self.cfg["transcript_folder"]))
         folder.mkdir(parents=True, exist_ok=True)
         tag = re.sub(r"[^\w.-]+", "_", Path(source).stem)[:40] if source else "call"
-        path = folder / f"{started:%Y-%m-%d_%H%M}_{tag}.md"
-        n = 2
-        while path.exists():
-            path = folder / f"{started:%Y-%m-%d_%H%M}_{tag}_{n}.md"
-            n += 1
-        path.write_text(md, encoding="utf-8")
+        with self._save_lock:  # jobs finish concurrently: keep names unique
+            path = folder / f"{started:%Y-%m-%d_%H%M}_{tag}.md"
+            n = 2
+            while path.exists():
+                path = folder / f"{started:%Y-%m-%d_%H%M}_{tag}_{n}.md"
+                n += 1
+            path.write_text(md, encoding="utf-8")
         return path
 
     def _dispose_wav(self, wav: Path, transcript: Path, source: str | None = None) -> None:

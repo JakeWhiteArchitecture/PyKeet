@@ -34,13 +34,20 @@ dictation_beep = false
 native_file_picker = true
 
 # --- Calls ---
-# Run call/file transcription on a second copy of the model, so dictation keeps working
-# while a call is being transcribed. Costs extra RAM and shares your CPU.
-# false = one model; dictation waits until the call is done.
-parallel_workers = true
+# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
+# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
+# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
+# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
+call_workers = 2
 # Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
 highlight_names = []
 highlight_companies = []
+# Use a small name-recognition model (spaCy) for better names/places/companies in the
+# transcript viewer. Optional install, see README. Falls back to simple rules if missing.
+use_ner = true
+# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
+# install; the other is the fallback.
+ner_model = "en_core_web_md"
 --------------------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
