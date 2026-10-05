@@ -56,8 +56,9 @@ call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
 import_shortcut = "ctrl+alt+o"
 
-# "push" = hold to talk, "toggle" = press to start, press to stop
-dictation_mode = "push"
+# "toggle" = press the shortcut once to start, again to stop and transcribe
+# "push"   = hold the shortcut while talking, release to transcribe
+dictation_mode = "toggle"
 
 # --- Speech engine ---------------------------------------------------------
 model = "moondream/parakeet-redux"
@@ -102,7 +103,7 @@ DEFAULTS = {
     "cancel_shortcut": "esc",
     "call_shortcut": "ctrl+alt+r",
     "import_shortcut": "ctrl+alt+o",
-    "dictation_mode": "push",
+    "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
     "call_model": "",
     "device": "cpu",
