@@ -5,7 +5,6 @@ See README.md for setup, shortcuts and limitations.
 """
 from __future__ import annotations
 
-import bisect
 import logging
 import getpass
 import json
@@ -92,14 +91,14 @@ native_file_picker = true
 # jobs wait in a queue. Dictation always has its own separate model and only ever runs one
 # at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
 call_workers = 2
-# Cut long silences out of a call / audio file before transcribing (faster, and cleaner for
-# the model). A silence is only cut once speech has clearly resumed, and `silence_keep_seconds`
-# of the quiet either side is always kept so the first sound of returning speech is never
-# clipped. Timestamps in the transcript are still real call time. The saved audio is untouched.
-trim_silence = true
-silence_min_seconds = 3.0     # only silences at least this long are shortened
-silence_keep_seconds = 0.6    # quiet kept before and after the speech
-silence_threshold_db = 0      # 0 = automatic (adapts to your room noise); or e.g. -45
+# Dictation only (not calls, meetings or audio files): cut long silent pauses, e.g. when you
+# stop to think, before transcribing. A silence is only cut once speech has clearly resumed, and
+# `dictation_silence_keep_seconds` of quiet either side is kept so the first sound of returning
+# speech is never clipped.
+trim_dictation_silence = true
+dictation_silence_min_seconds = 2.0   # only silences at least this long are shortened
+dictation_silence_keep_seconds = 0.4  # quiet kept before and after the speech
+dictation_silence_threshold_db = 0    # 0 = automatic (adapts to your room noise); or e.g. -45
 # Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
 highlight_names = []
 highlight_companies = []
@@ -137,10 +136,10 @@ DEFAULTS = {
     "import_shortcut": "ctrl+alt+o",
     "native_file_picker": True,
     "call_workers": 2,
-    "trim_silence": True,
-    "silence_min_seconds": 3.0,
-    "silence_keep_seconds": 0.6,
-    "silence_threshold_db": 0,
+    "trim_dictation_silence": True,
+    "dictation_silence_min_seconds": 2.0,
+    "dictation_silence_keep_seconds": 0.4,
+    "dictation_silence_threshold_db": 0,
     "highlight_names": [],
     "highlight_companies": [],
     "use_ner": True,
@@ -364,8 +363,7 @@ def group_lines(units, word_level: bool):
 
 
 def build_markdown(started: datetime, duration: float, turns, labelled: bool, rules,
-                   recovered: bool = False, source: str | None = None,
-                   trimmed: float = 0.0) -> str:
+                   recovered: bool = False, source: str | None = None) -> str:
     out = [
         "# Audio transcript" if source else "# Call transcript",
         f"- Date: {started:%Y-%m-%d %H:%M}",
@@ -375,8 +373,6 @@ def build_markdown(started: datetime, duration: float, turns, labelled: bool, ru
     ]
     if source:
         out.insert(1, f"- Source: {source}")
-    if trimmed >= 1:
-        out.append(f"- Silence trimmed: {fmt_duration(trimmed)} (timestamps are real time)")
     if recovered:
         out.append("- Note: recovered after the app stopped mid-call")
     if labelled:
@@ -707,12 +703,6 @@ class WavWriter:
             self._fh.flush()
             self._last_flush = time.monotonic()
 
-    def write_pcm(self, pcm16: np.ndarray) -> None:
-        """Write samples that are already 16-bit (no float round trip)."""
-        data = np.ascontiguousarray(pcm16, dtype="<i2").tobytes()
-        self._fh.write(data)
-        self._bytes += len(data)
-
     def close(self) -> float:
         self._fh.seek(0)
         self._fh.write(_wav_header(self._bytes))
@@ -725,23 +715,6 @@ class WavWriter:
 # --------------------------------------------------------------------------
 
 FRAME = SAMPLE_RATE // 50  # 20 ms analysis frames
-
-
-class TimeMap:
-    """Maps a time in the trimmed audio back to the time in the original recording."""
-
-    def __init__(self, segs: list[tuple[float, float]]):
-        self.segs = segs  # (original_start_s, length_s) of each kept piece, in order
-        self.tstarts: list[float] = []
-        acc = 0.0
-        for _o, length in segs:
-            self.tstarts.append(acc)
-            acc += length
-        self.total = acc
-
-    def to_original(self, t: float) -> float:
-        i = max(0, bisect.bisect_right(self.tstarts, t) - 1)
-        return self.segs[i][0] + (t - self.tstarts[i])
 
 
 def frame_db(pcm: np.ndarray) -> np.ndarray:
@@ -818,30 +791,18 @@ def keep_intervals(db: np.ndarray, min_gap_s: float = 3.0, keep_s: float = 0.6,
     return out
 
 
-def trim_wav(src: Path, dest: Path, min_gap_s: float = 3.0, keep_s: float = 0.6,
-             threshold_db: float = 0.0) -> tuple[TimeMap, float] | None:
-    """Write `dest` = `src` with long silences shortened. Returns (TimeMap, seconds removed),
-    or None if nothing worth cutting (then `dest` is not created)."""
-    pcm = np.memmap(src, dtype="<i2", mode="r", offset=44)
-    if len(pcm) < FRAME * 100:
-        return None
+def trim_audio(samples: np.ndarray, min_gap_s: float, keep_s: float,
+                threshold_db: float = 0.0) -> np.ndarray | None:
+    """`samples` (mono float32) with long silences shortened, or None if nothing worth cutting."""
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
     iv = keep_intervals(frame_db(pcm), min_gap_s, keep_s, threshold_db)
     if not iv:
         return None
-    total = len(pcm)
+    total = len(samples)
     spans = [(a * FRAME, min(b * FRAME, total)) for a, b in iv]
-    removed = (total - sum(b - a for a, b in spans)) / SAMPLE_RATE
-    if removed < 1.0:
+    if (total - sum(b - a for a, b in spans)) / SAMPLE_RATE < 0.5:
         return None
-    w = WavWriter(dest)
-    try:
-        for a, b in spans:
-            for i in range(a, b, SAMPLE_RATE * 60):
-                w.write_pcm(pcm[i:min(i + SAMPLE_RATE * 60, b)])
-    finally:
-        w.close()
-    del pcm
-    return TimeMap([(a / SAMPLE_RATE, (b - a) / SAMPLE_RATE) for a, b in spans]), removed
+    return np.concatenate([samples[a:b] for a, b in spans])
 
 
 # --------------------------------------------------------------------------
@@ -1851,6 +1812,18 @@ class App:
     def _dictation_worker(self, audio: np.ndarray, elapsed: float) -> None:
         t = time.monotonic()
         try:
+            if self.cfg["trim_dictation_silence"] and elapsed > 2 * self.cfg[
+                    "dictation_silence_min_seconds"]:
+                try:
+                    trimmed = trim_audio(audio, float(self.cfg["dictation_silence_min_seconds"]),
+                                         float(self.cfg["dictation_silence_keep_seconds"]),
+                                         float(self.cfg["dictation_silence_threshold_db"]))
+                    if trimmed is not None:
+                        log.info("dictation: trimmed silence %.1fs -> %.1fs", len(audio) /
+                                 SAMPLE_RATE, len(trimmed) / SAMPLE_RATE)
+                        audio = trimmed
+                except Exception:
+                    log.exception("silence trimming failed; using the full audio")
             result = self.engine.transcribe(self.engine.main, audio=audio,
                                             sample_rate=SAMPLE_RATE, timestamps="none")
             raw = str(result.get("text", ""))
@@ -1956,41 +1929,24 @@ class App:
     def process_call(self, wav: Path, started: datetime, duration: float, jid: int,
                      recovered: bool = False, source: str | None = None) -> None:
         t0 = time.monotonic()
-        trim_path = wav.with_suffix(".trim.wav")
         try:
             want_labels = bool(self.cfg["label_speakers"])
-            # 1. optionally cut long silences (timestamps are mapped back to real time later)
-            work_wav, work_dur, tmap, removed = wav, duration, None, 0.0
-            if self.cfg["trim_silence"] and duration > 2 * self.cfg["silence_min_seconds"]:
-                self.job_phase(jid, "call_preparing")
-                try:
-                    res = trim_wav(wav, trim_path, float(self.cfg["silence_min_seconds"]),
-                                   float(self.cfg["silence_keep_seconds"]),
-                                   float(self.cfg["silence_threshold_db"]))
-                    if res:
-                        tmap, removed = res
-                        work_wav, work_dur = trim_path, tmap.total
-                        log.info("call: trimmed silence %.0fs -> %.0fs (%.0fs removed)",
-                                 duration, work_dur, removed)
-                except Exception:
-                    log.exception("silence trimming failed; using the full audio")
-                    trim_path.unlink(missing_ok=True)
             self.job_phase(jid, "call_queued")  # waits here if every model copy is busy
             with self.engine.call_worker() as speech:  # may load a model copy the first time
-                self.job_phase(jid, "call_transcribing", work_dur, "transcribe")
+                self.job_phase(jid, "call_transcribing", duration, "transcribe")
                 result = self.engine.transcribe(
-                    speech, audio=str(work_wav), timestamps="word" if want_labels else "segment")
+                    speech, audio=str(wav), timestamps="word" if want_labels else "segment")
             self.job_end_phase(jid)
             units, word_level = extract_units(result)
-            log.info("call: transcribed %.0fs in %.1fs (%d units)", work_dur,
+            log.info("call: transcribed %.0fs in %.1fs (%d units)", duration,
                      time.monotonic() - t0, len(units))
 
             turns = None
             if want_labels and word_level and units:
                 try:
-                    self.job_phase(jid, "call_labelling", work_dur, "diarize")
+                    self.job_phase(jid, "call_labelling", duration, "diarize")
                     t1 = time.monotonic()
-                    segments = self.run_diarize(work_wav, work_dur)
+                    segments = self.run_diarize(wav, duration)
                     self.job_end_phase(jid, record=self._diarize_warm)  # 1st run loads models
                     self._diarize_warm = True
                     if not segments:
@@ -2007,11 +1963,8 @@ class App:
             labelled = turns is not None
             if turns is None:
                 turns = group_lines(units, word_level)
-            if tmap is not None:  # trimmed time -> real call time
-                turns = [(tmap.to_original(t[0]), t[1], t[2]) for t in turns]
 
-            md = build_markdown(started, duration, turns, labelled, self.rules, recovered, source,
-                                removed)
+            md = build_markdown(started, duration, turns, labelled, self.rules, recovered, source)
             path = self._save_transcript(started, md, source)
             self._dispose_wav(wav, path, source)
             self.last_transcript = path
@@ -2027,8 +1980,6 @@ class App:
                 self.notify("PyKeet", f"Could not transcribe {source}. See pykeet.log.")
             else:
                 self.notify("PyKeet", f"Call transcription failed. Audio kept: {wav.name}")
-        finally:
-            trim_path.unlink(missing_ok=True)
 
     # -- audio file import ----------------------------------------------------------
     def show_text(self, title: str, body: str, path=None, markdown: bool = False) -> None:

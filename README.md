@@ -101,15 +101,13 @@ file can't be read, a window shows the exact reason.
   model per worker) and your CPU is shared, so each job is slower while they overlap. Set
   `call_workers = 1` for a single background job, or `0` to share the dictation model (dictation then
   waits while a call job runs).
-- **Silence trimming.** For calls and audio files, long silences are cut out before transcribing
-  (`trim_silence = true`). Only silences of `silence_min_seconds` (3 s) or more are shortened, and
-  `silence_keep_seconds` (0.6 s) of quiet is always kept before and after the speech, so the first
-  sound of a returning voice is never clipped; shorter pauses are untouched. The speech/quiet
-  level adapts to your room noise (set `silence_threshold_db` to a number like `-45` to override). It
-  is applied to the recorded file after the call stops, so the full audio is on disk until then (a crash
-  loses nothing) and the cutting only happens once the whole recording shows where speech resumes.
-  Transcript timestamps stay in real call time, and the header notes how much silence was removed.
-  Your saved audio (`keep_audio`) is never altered. Dictation is not trimmed.
+- **Silence trimming (dictation only).** When you dictate, long silent pauses (e.g. you stop to think) are
+  cut out before transcribing (`trim_dictation_silence = true`). Only silences of
+  `dictation_silence_min_seconds` (2 s) or more are shortened, and `dictation_silence_keep_seconds`
+  (0.4 s) of quiet is always kept before and after your speech, so the first sound of a returning voice
+  is never clipped; shorter pauses are untouched. A silence is only cut once speech has clearly resumed
+  after it, and the level adapts to your room noise (set `dictation_silence_threshold_db` to a number like
+  `-45` to override). Calls, meetings and imported audio files are **not** trimmed.
 - **Transcript viewer.** Imported files, and tray > Show last transcript, open a small Markdown viewer
   (headings, bold speaker names, grey timestamps). Names / proper nouns (blue), phone numbers (green),
   addresses and postcodes (orange), companies (purple) and emails (teal) are coloured. This is
