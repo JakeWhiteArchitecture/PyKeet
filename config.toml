@@ -73,6 +73,11 @@ action_backend = "zeroshot"
 #            BitNet models, Ollama, LM Studio...). Set action_server to its address.
 #            PyKeet installs nothing for this; you start the server, PyKeet just asks it.
 action_server = "http://127.0.0.1:8080"
+# "needle" = Cactus Needle 3, a tiny (8-29 MB) tool-calling model that runs on the CPU:
+#            pip install cactus-needle   (action_model is not needed for this one).
+#            Each label is a "tool" and the model picks the right one for each sentence.
+#            First use downloads the model and a small engine library from Hugging Face.
+#            PyKeet switches off its anonymous usage pings (NEEDLE_TELEMETRY=0).
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true

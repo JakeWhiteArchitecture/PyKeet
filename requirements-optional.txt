@@ -12,3 +12,5 @@ diarize
 spacy
 # Optional, for the AI decision/task detector (config: action_model). Uses the PyTorch you have.
 # transformers
+# Optional, tiny decision/task detector (config: action_backend = "needle"). ~no dependencies.
+# cactus-needle

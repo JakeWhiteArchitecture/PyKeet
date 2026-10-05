@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.0"
+VERSION = "1.1"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -126,6 +126,11 @@ action_backend = "zeroshot"
 #            BitNet models, Ollama, LM Studio...). Set action_server to its address.
 #            PyKeet installs nothing for this; you start the server, PyKeet just asks it.
 action_server = "http://127.0.0.1:8080"
+# "needle" = Cactus Needle 3, a tiny (8-29 MB) tool-calling model that runs on the CPU:
+#            pip install cactus-needle   (action_model is not needed for this one).
+#            Each label is a "tool" and the model picks the right one for each sentence.
+#            First use downloads the model and a small engine library from Hugging Face.
+#            PyKeet switches off its anonymous usage pings (NEEDLE_TELEMETRY=0).
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true
@@ -754,6 +759,61 @@ class LLMActionModel:
         return [scores_to_prediction(self._letter_logits(x)) for x in sentences]
 
 
+# label -> (tool name shown to the model, description with an example)
+NEEDLE_TOOLS = {
+    "decision_open": ("decision_to_make",
+                      "A decision that has NOT been made yet: a question about what to choose, "
+                      "or something still to be decided. Example: 'should we use oak or larch?'"),
+    "option": ("options_available",
+               "Options or alternatives being listed to choose between. Example: 'option A is "
+               "a single storey extension, option B adds a loft.'"),
+    "decision_made": ("decision_made",
+                      "A decision that HAS been made or agreed. Example: 'we've decided to go "
+                      "with larch.'"),
+    "task_open": ("task_to_do",
+                  "A task or action someone has to do or has promised to do. Example: 'I'll "
+                  "send the drawings on Friday.'"),
+    "task_done": ("task_done",
+                  "A task that has ALREADY been completed. Example: 'I've sent the invoice to "
+                  "Sarah.'"),
+}
+
+
+class NeedleActionModel:
+    """Cactus Needle 3 (tiny tool-calling model). Each label is a tool; the tool it chooses for
+    a sentence is the label, an empty answer means 'neither'. Optional."""
+
+    def __init__(self):
+        os.environ["NEEDLE_TELEMETRY"] = "0"  # no usage pings: PyKeet stays local
+        import needle  # ImportError if cactus-needle is not installed
+
+        self.by_name = {name: kind for kind, (name, _doc) in NEEDLE_TOOLS.items()}
+        tools = []
+        for kind, (name, doc) in NEEDLE_TOOLS.items():
+            def fn(text: str):
+                return {}
+            fn.__name__ = fn.__qualname__ = name
+            fn.__doc__ = doc
+            tools.append(needle.tool(fn))
+        self.agent = needle.Needle(tools=tools, stateless=True, auto_date=False)
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        out = []
+        for sent in sentences:
+            resp = self.agent.complete(" ".join(sent.split()[:60]), 96)
+            calls = resp.get("function_calls") or []
+            if not calls:
+                out.append((None, 0.6))  # the model had nothing to say: let the rules decide
+                continue
+            kind = self.by_name.get(str(calls[0].get("name")))
+            if kind is None:
+                out.append((None, 0.0))  # not one of our tools: ignore, keep the rules' answer
+                continue
+            conf = resp.get("confidence")
+            out.append((kind, float(conf) if isinstance(conf, (int, float)) else 0.7))
+        return out
+
+
 class ServerActionModel:
     """Asks a local model server (OpenAI-style /v1/completions) to pick the answer letter.
     Works with any model the server runs, including ternary BitNet models via bitnet.cpp."""
@@ -817,7 +877,9 @@ def get_action_model(name: str, backend: str = "zeroshot", server: str = ""):
     key = (name, backend, server)
     if key not in _ACTION_MODELS:
         try:
-            if backend == "server":
+            if backend == "needle":
+                _ACTION_MODELS[key] = NeedleActionModel()
+            elif backend == "server":
                 _ACTION_MODELS[key] = ServerActionModel(server, name)
             elif backend == "llm":
                 _ACTION_MODELS[key] = LLMActionModel(name)
@@ -1858,7 +1920,7 @@ class Widget:
         model_name = str(self.app.cfg.get("action_model") or "")
         backend = str(self.app.cfg.get("action_backend") or "zeroshot")
         if (markdown and self.app.cfg.get("highlight_actions")
-                and (model_name or backend == "server")):
+                and (model_name or backend in ("server", "needle"))):
             status.pack(side="bottom", fill="x", padx=10)
             status.configure(text="Analysing decisions and tasks with the AI model "
                                   "(the first time it downloads the model)…")

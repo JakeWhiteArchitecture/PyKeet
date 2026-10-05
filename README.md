@@ -131,7 +131,14 @@ file can't be read, a window shows the exact reason.
   `action_model = "Qwen/Qwen2.5-0.5B-Instruct"` (about 1 GB; understands wording better than the
   classifier but takes minutes on a long call; `Qwen2.5-1.5B-Instruct` is better and slower; models
   under ~0.5B such as Gemma 3 270M are usually too small to be reliable). It is shown worked examples
-  and picks an answer letter for each sentence. You can also point PyKeet at a model server you run yourself:
+  and picks an answer letter for each sentence. **Needle 3** (Cactus Compute, Apache-2.0) is the lightest option: a tiny 8-29 MB tool-calling model
+  that runs on the CPU and installs with almost nothing (`pip install cactus-needle`). Set
+  `action_backend = "needle"`. Each label becomes a "tool" and the model picks one per sentence (or
+  none). Good to know: the first use downloads the model and a small native engine library from
+  Hugging Face (after that it works offline), and the package would send anonymous usage pings by
+  default, which PyKeet switches off (`NEEDLE_TELEMETRY=0`). It is built for phone-style tool calls, so
+  test it on a real transcript before trusting it.
+You can also point PyKeet at a model server you run yourself:
   `action_backend = "server"` and `action_server = "http://127.0.0.1:8080"` (llama.cpp's
   `llama-server`, Ollama, LM Studio, or Microsoft's `bitnet.cpp` server for ternary BitNet models
   such as BitNet b1.58 2B4T, which is about 0.4 GB and fast on a CPU but needs its own build, see its
