@@ -1,4 +1,4 @@
-# PyKeeta
+# PyKeet
 
 Local, offline dictation and call transcription, built on Moondream Parakeet.
 No cloud, no account, no word limits.
@@ -76,20 +76,20 @@ tray notification cannot be clicked through, so use the tray's "Show last transc
 ## Autostart on login
 
 - **Windows:** `Win+R`, type `shell:startup`, add a shortcut to
-  `C:\path\to\.venv\Scripts\pythonw.exe C:\path\to\PyKeeta\main.py` (start in the PyKeeta folder).
-- **Linux:** create `~/.config/autostart/pykeeta.desktop`:
+  `C:\path\to\.venv\Scripts\pythonw.exe C:\path\to\PyKeet\main.py` (start in the PyKeet folder).
+- **Linux:** create `~/.config/autostart/pykeet.desktop`:
   ```
   [Desktop Entry]
   Type=Application
-  Name=PyKeeta
-  Path=/path/to/PyKeeta
-  Exec=/path/to/PyKeeta/.venv/bin/python main.py
+  Name=PyKeet
+  Path=/path/to/PyKeet
+  Exec=/path/to/PyKeet/.venv/bin/python main.py
   ```
 - **macOS:** System Settings > General > Login Items, add a small launcher script that runs the same command.
 
 ## Known limitations
 
-- **Hotkey consumption:** only on Windows does PyKeeta swallow `Ctrl+Space` so the focused app never
+- **Hotkey consumption:** only on Windows does PyKeet swallow `Ctrl+Space` so the focused app never
   sees it. On Linux/macOS pynput cannot do that, so the app also receives the keys (a warning is
   logged). If that clashes (VS Code autocomplete, input-language switching), change `dictation_shortcut`.
 - **Linux Wayland:** pynput hotkeys and key injection do not work. Use an X11 session. (Wayland would need
@@ -101,4 +101,4 @@ tray notification cannot be clicked through, so use the tray's "Show last transc
 - **Widget corners** are truly transparent only on Windows; elsewhere it is a dark pill on a rectangle.
 - **Licences:** Parakeet weights are CC-BY-4.0, `diarize` is Apache 2.0. Check the moondream / Photon
   engine licence separately before publishing this as open source.
-- Logs go to `pykeeta.log` (rotating). Transcript text is only logged when `debug = true`.
+- Logs go to `pykeet.log` (rotating). Transcript text is only logged when `debug = true`.

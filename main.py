@@ -1,4 +1,4 @@
-"""PyKeeta: local, offline dictation + call transcription on Moondream Parakeet.
+"""PyKeet: local, offline dictation + call transcription on Moondream Parakeet.
 
 Run with:  python main.py
 See README.md for setup, shortcuts and limitations.
@@ -30,7 +30,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
-LOG_PATH = HERE / "pykeeta.log"
+LOG_PATH = HERE / "pykeet.log"
 TMP_DIR = HERE / "tmp"  # temporary call WAVs live here
 
 SAMPLE_RATE = 16_000
@@ -39,14 +39,14 @@ MAX_DICTATION_SECONDS = 5 * 60
 MAX_CALL_SECONDS = 2 * 60 * 60
 PASTE_RESTORE_SECONDS = 0.3
 
-log = logging.getLogger("pykeeta")
+log = logging.getLogger("pykeet")
 
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
 
 CONFIG_TEMPLATE = '''\
-# PyKeeta config. Edit, then restart the app.
+# PyKeet config. Edit, then restart the app.
 
 # --- Shortcuts -------------------------------------------------------------
 dictation_shortcut = "ctrl+space"
@@ -128,7 +128,7 @@ def load_config() -> dict:
         cfg.update(data)
     except Exception:
         print(f"Could not read {CONFIG_PATH}; using defaults.", file=sys.stderr)
-        logging.getLogger("pykeeta").exception("config read failed")
+        logging.getLogger("pykeet").exception("config read failed")
         cfg["replacements"] = {}
     return cfg
 
@@ -149,7 +149,7 @@ def save_widget_position(x: int, y: int) -> None:
 
 def setup_logging(debug: bool) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    root = logging.getLogger("pykeeta")
+    root = logging.getLogger("pykeet")
     root.setLevel(logging.DEBUG if debug else logging.INFO)
     root.handlers.clear()
     fh = logging.handlers.RotatingFileHandler(
@@ -779,7 +779,7 @@ class Widget:
         self.tk = tk
         self.q: queue.Queue = queue.Queue()
         self.root = tk.Tk()
-        self.root.title("PyKeeta")
+        self.root.title("PyKeet")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         try:
@@ -1024,7 +1024,7 @@ class App:
                 self.engine.load()
             except Exception:
                 log.exception("could not load speech model")
-                self.notify("PyKeeta", "Could not load the speech model. See pykeeta.log.")
+                self.notify("PyKeet", "Could not load the speech model. See pykeet.log.")
                 return
             try:
                 self.recover_calls()
@@ -1032,7 +1032,7 @@ class App:
                 log.exception("crash recovery failed")
             self.ready = True
             log.info("ready")
-            self.notify("PyKeeta", "Ready.")
+            self.notify("PyKeet", "Ready.")
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1249,7 +1249,7 @@ class App:
             self.notify("Call transcript saved", path.name, path)
         except Exception:
             log.exception("call processing failed; audio kept at %s", wav)
-            self.notify("PyKeeta", f"Call transcription failed. Audio kept: {wav.name}")
+            self.notify("PyKeet", f"Call transcription failed. Audio kept: {wav.name}")
         finally:
             self._set_idle()
             self.ui("hidden")
@@ -1328,7 +1328,7 @@ class App:
             pystray.MenuItem("Open config", lambda: open_path(CONFIG_PATH)),
             pystray.MenuItem("Quit", lambda: self.post(self.quit)),
         )
-        self.tray = pystray.Icon("pykeeta", img, "PyKeeta", menu)
+        self.tray = pystray.Icon("pykeet", img, "PyKeet", menu)
         self.tray.run_detached()
 
     def _toggle_pause(self, *_a) -> None:
@@ -1344,7 +1344,7 @@ class App:
         if files:
             open_path(files[-1])
         else:
-            self.notify("PyKeeta", "No call transcripts yet.")
+            self.notify("PyKeet", "No call transcripts yet.")
 
     def open_folder(self) -> None:
         folder = Path(os.path.expanduser(self.cfg["transcript_folder"]))
@@ -1372,7 +1372,7 @@ class App:
 def main() -> None:
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))
-    log.info("PyKeeta starting (python %s)", sys.version.split()[0])
+    log.info("PyKeet starting (python %s)", sys.version.split()[0])
     try:
         import tkinter  # noqa: F401
     except ImportError:
