@@ -42,7 +42,7 @@ Widget: click while dictating = stop and insert, right-click = cancel. It is dra
 position. During a call it shows "CALL" and ignores clicks; stop with the shortcut or the tray menu.
 While a call is being recorded the dictation shortcut is disabled.
 
-Tray menu: Start/Stop call, Pause dictation, Show last transcript (opens the latest call transcript),
+Tray menu: Start/Stop call, Transcribe audio file…, Pause dictation, Show last transcript (opens the latest call transcript),
 Open call transcripts, Open config, Quit.
 
 ## Config
@@ -54,6 +54,16 @@ Everything is in `config.toml` (commented). Highlights: shortcuts, `dictation_mo
 
 For a GPU, set `call_model = "moondream/parakeet-ultra"` and `call_device = "cuda"` (it is loaded the
 first time you record a call).
+
+## Transcribing an audio file
+
+Tray menu > **Transcribe audio file…** opens a file picker for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
+several to batch them). Each file is decoded to 16 kHz mono, transcribed with the call settings
+(speaker labelling included, same fallbacks), and saved in your transcript folder as
+`YYYY-MM-DD_HHMM_<filename>.md`. When it finishes, a **text window** shows the transcript with
+**Copy all** and **Open file** buttons. Your original file is never modified or deleted. It is
+unavailable while a recording or another job is running. MP3 needs `soundfile` 0.12+ (included in
+`requirements.txt`).
 
 ## Call transcripts
 
