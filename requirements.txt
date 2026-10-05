@@ -1,5 +1,8 @@
 # Core: needed for dictation and call transcription
 moondream>=2.4.1
+# One shared PyTorch for moondream (needs >=2.8) and diarize (needs <2.9). Without this pin
+# pip fetches two huge copies (several GB each) and can fill the disk.
+torch>=2.8,<2.9
 numpy
 sounddevice
 pynput

@@ -24,6 +24,10 @@ pip install -r requirements-optional.txt   # tray icon, file import, speaker lab
 python main.py
 ```
 
+**Disk space:** the install needs roughly 8-10 GB free (PyTorch plus NVIDIA libraries, even on CPU).
+Check with `df -h .` first, delete old copies of this folder (each has its own `.venv`), and run
+`pip cache purge` if space is tight.
+
 The two files are separate on purpose: if an optional package (usually `diarize`, which pulls in
 PyTorch) fails to install, the core app still works. At startup PyKeet logs which packages are
 missing and the exact `pip` command for the Python it is running. Always run `python main.py` from
