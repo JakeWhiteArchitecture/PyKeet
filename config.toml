@@ -5,6 +5,8 @@ dictation_shortcut = "ctrl+space"
 recall_shortcut = "f8"
 cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
+# Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
+import_shortcut = "ctrl+alt+o"
 
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
@@ -27,7 +29,26 @@ cleanup = true            # strip um/uh, collapse repeats, apply replacements
 insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
 dictation_beep = false
 
-# --- Calls -----------------------------------------------------------------
+# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
+# false = use the basic built-in dialog.
+native_file_picker = true
+
+# --- Calls ---
+# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
+# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
+# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
+# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
+call_workers = 2
+# Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
+highlight_names = []
+highlight_companies = []
+# Use a small name-recognition model (spaCy) for better names/places/companies in the
+# transcript viewer. Optional install, see README. Falls back to simple rules if missing.
+use_ner = true
+# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
+# install; the other is the fallback.
+ner_model = "en_core_web_md"
+--------------------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
 keep_audio = false        # keep the call WAV next to the transcript
