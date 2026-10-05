@@ -9,6 +9,7 @@ import logging
 import getpass
 import json
 import logging.handlers
+import math
 import os
 import queue
 import re
@@ -113,6 +114,13 @@ highlight_actions = true
 #   "typeform/distilbert-base-uncased-mnli"                    (bigger, well known)
 # Analysis runs in the background after the viewer opens; the rules show straight away.
 action_model = ""
+# "zeroshot" = small classifier model (names like ...zeroshot... / ...mnli).
+# "llm" = a small chat/instruct language model that is shown examples and asked to pick a
+#         label, e.g. "Qwen/Qwen2.5-0.5B-Instruct" (~1 GB; better wording understanding than
+#         the classifier but slower: minutes for a long call, run in the background) or
+#         "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB, better, slower still). Models under ~0.5B
+#         (e.g. Gemma 3 270M) are usually too small to be reliable at this.
+action_backend = "zeroshot"
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true
@@ -156,6 +164,7 @@ DEFAULTS = {
     "use_ner": True,
     "highlight_actions": True,
     "action_model": "",
+    "action_backend": "zeroshot",
     "ner_model": "en_core_web_md",
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
@@ -638,7 +647,7 @@ _SENTENCE = re.compile(r"[^.?!]+[.?!]*")
 
 
 _MODEL_KINDS: dict[str, str | None] = {}  # sentence -> kind decided by rules + AI model
-_ACTION_MODELS: dict[str, "ActionModel | None"] = {}
+_ACTION_MODELS: dict[tuple, object] = {}
 ACTION_MODEL_LABELS = {
     "decision_open": "a decision that still has to be made",
     "option": "options or alternatives to choose between",
@@ -668,16 +677,89 @@ class ActionModel:
                 for r in res]
 
 
-def get_action_model(name: str):
-    if name not in _ACTION_MODELS:
+LLM_LETTERS = dict(zip("ABCDEF", ACTION_MODEL_LABELS))  # A..E = kinds, F = none (None)
+LLM_PROMPT = """Classify each sentence from a meeting transcript.
+A = a decision that still has to be made
+B = options or alternatives to choose between
+C = a decision that has been made
+D = a task someone needs to do
+E = a task that has been done
+F = none of these (small talk, description, opinion)
+
+Sentence: We still need to decide whether to go with oak or larch.
+Answer: A
+
+Sentence: Option A is the single storey extension and option B adds a loft.
+Answer: B
+
+Sentence: So yeah I think we'll go larch.
+Answer: C
+
+Sentence: Somebody needs to chase the council about the beam.
+Answer: D
+
+Sentence: I've already sent the invoice to Sarah.
+Answer: E
+
+Sentence: The weather was awful on the day of the site visit.
+Answer: F
+
+Sentence: {sentence}
+Answer:"""
+
+
+def llm_prompt(sentence: str) -> str:
+    return LLM_PROMPT.format(sentence=" ".join(sentence.split()[:60]))
+
+
+def scores_to_prediction(letter_logits: dict[str, float]) -> tuple[str | None, float]:
+    """Softmax over the six answer letters -> (kind or None, probability)."""
+    top = max(letter_logits.values())
+    exps = {k: math.exp(v - top) for k, v in letter_logits.items()}
+    total = sum(exps.values())
+    best = max(exps, key=exps.get)
+    return LLM_LETTERS[best], exps[best] / total
+
+
+class LLMActionModel:
+    """Small instruct language model: show it examples, read which answer letter it prefers
+    (one forward pass per sentence, no free-text generation to parse). Optional."""
+
+    def __init__(self, name: str):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.torch = torch
+        self.tok = AutoTokenizer.from_pretrained(name)
+        self.model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32).eval()
+        self.ids = {}
+        for letter in LLM_LETTERS:
+            self.ids[letter] = {self.tok.encode(" " + letter, add_special_tokens=False)[-1],
+                                self.tok.encode(letter, add_special_tokens=False)[-1]}
+
+    def _letter_logits(self, sentence: str) -> dict[str, float]:
+        enc = self.tok(llm_prompt(sentence), return_tensors="pt")
+        with self.torch.no_grad():
+            logits = self.model(**enc).logits[0, -1]
+        return {letter: float(self.torch.logsumexp(logits[list(ids)], dim=0))
+                for letter, ids in self.ids.items()}
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        return [scores_to_prediction(self._letter_logits(x)) for x in sentences]
+
+
+def get_action_model(name: str, backend: str = "zeroshot"):
+    key = (name, backend)
+    if key not in _ACTION_MODELS:
         try:
-            _ACTION_MODELS[name] = ActionModel(name)
-            log.info("action detection: using model %s", name)
+            _ACTION_MODELS[key] = (LLMActionModel(name) if backend == "llm"
+                                   else ActionModel(name))
+            log.info("action detection: using %s model %s", backend, name)
         except Exception as exc:
             log.warning("action detection: could not load %s (%s: %s); using rules",
                         name, type(exc).__name__, exc)
-            _ACTION_MODELS[name] = None
-    return _ACTION_MODELS[name]
+            _ACTION_MODELS[key] = None
+    return _ACTION_MODELS[key]
 
 
 def combine_kind(rule_kind: str | None, model_kind: str | None, score: float) -> str | None:
@@ -1713,7 +1795,8 @@ class Widget:
 
             def work():
                 try:
-                    model = get_action_model(model_name)
+                    model = get_action_model(model_name, str(self.app.cfg.get("action_backend")
+                                                             or "zeroshot"))
                     if model is None:
                         raise RuntimeError("model could not be loaded; see pykeet.log")
                     analyse_actions(body, model)

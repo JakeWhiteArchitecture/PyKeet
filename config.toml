@@ -61,6 +61,13 @@ highlight_actions = true
 #   "typeform/distilbert-base-uncased-mnli"                    (bigger, well known)
 # Analysis runs in the background after the viewer opens; the rules show straight away.
 action_model = ""
+# "zeroshot" = small classifier model (names like ...zeroshot... / ...mnli).
+# "llm" = a small chat/instruct language model that is shown examples and asked to pick a
+#         label, e.g. "Qwen/Qwen2.5-0.5B-Instruct" (~1 GB; better wording understanding than
+#         the classifier but slower: minutes for a long call, run in the background) or
+#         "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB, better, slower still). Models under ~0.5B
+#         (e.g. Gemma 3 270M) are usually too small to be reliable at this.
+action_backend = "zeroshot"
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true

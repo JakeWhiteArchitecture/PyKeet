@@ -127,7 +127,11 @@ file can't be read, a window shows the exact reason.
   speech ("so yeah we'll go larch"). For better results set `action_model` in `config.toml` to a small
   zero-shot AI model, e.g. `MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33` (needs
   `pip install transformers`; downloads once; runs in the background after the viewer opens, with the
-  rules shown straight away). Treat both as a guide, not minutes: always check against the transcript.
+  rules shown straight away). A small chat language model can be used instead: `action_backend = "llm"` with
+  `action_model = "Qwen/Qwen2.5-0.5B-Instruct"` (about 1 GB; understands wording better than the
+  classifier but takes minutes on a long call; `Qwen2.5-1.5B-Instruct` is better and slower; models
+  under ~0.5B such as Gemma 3 270M are usually too small to be reliable). It is shown worked examples
+  and picks an answer letter for each sentence. Treat both as a guide, not minutes: always check against the transcript.
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
