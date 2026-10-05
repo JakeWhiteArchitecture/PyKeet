@@ -1,0 +1,9 @@
+moondream>=2.4.1
+numpy
+sounddevice
+pynput
+pyperclip
+pystray
+Pillow
+diarize
+tomli; python_version < "3.11"
