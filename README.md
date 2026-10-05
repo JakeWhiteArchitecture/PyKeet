@@ -19,21 +19,28 @@ Python 3.10+ (moondream needs 3.10 or newer).
 ```
 python -m venv .venv
 # Windows:  .venv\Scripts\activate      Linux/macOS:  source .venv/bin/activate
-pip install -r requirements.txt            # core: dictation + calls
-pip install -r requirements-optional.txt   # tray icon, file import, speaker labels
+
+# CPU only (recommended unless you have an NVIDIA GPU): install the small CPU build of PyTorch first.
+pip install --no-cache-dir torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+
+pip install --no-cache-dir -r requirements.txt            # core: dictation + calls
+pip install --no-cache-dir -r requirements-optional.txt   # tray icon, file import, speaker labels
 python main.py
 ```
 
-**Disk space:** the install needs roughly 8-10 GB free (PyTorch plus NVIDIA libraries, even on CPU).
-Check with `df -h .` first, delete old copies of this folder (each has its own `.venv`), and run
-`pip cache purge` if space is tight.
+**Disk space:** with the CPU-only PyTorch the whole install is roughly 2-3 GB. Skipping the first
+`pip install` line (the default PyTorch) pulls in about 3 GB of NVIDIA GPU libraries and needs
+8-10 GB free. Only do that if you have an NVIDIA GPU and want `device = "cuda"`. Check space with
+`df -h .`, delete old copies of this folder (each has its own `.venv`), and run `pip cache purge`
+if it is tight.
 
-The two files are separate on purpose: if an optional package (usually `diarize`, which pulls in
-PyTorch) fails to install, the core app still works. At startup PyKeet logs which packages are
+The two requirements files are separate on purpose: if an optional package (usually `diarize`)
+fails to install, the core app still works. At startup PyKeet logs which packages are
 missing and the exact `pip` command for the Python it is running. Always run `python main.py` from
 the same terminal/venv you installed into.
 
-Linux also needs: `sudo apt install python3-tk xclip libportaudio2` (plus `libnotify-bin` for notifications).
+Linux also needs system packages. Debian/Ubuntu: `sudo apt install python3-tk xclip libportaudio2 libnotify-bin`.
+Fedora: `sudo dnf install python3-tkinter xclip portaudio libnotify`.
 `config.toml` is created next to `main.py` on first run. The first start loads the model (a download
 the first time, then fully offline); the tray shows "Ready." when it is done.
 
