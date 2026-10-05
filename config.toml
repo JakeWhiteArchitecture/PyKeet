@@ -68,6 +68,11 @@ action_model = ""
 #         "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB, better, slower still). Models under ~0.5B
 #         (e.g. Gemma 3 270M) are usually too small to be reliable at this.
 action_backend = "zeroshot"
+# "server" = talk to a model you run yourself in a local server that speaks the common
+#            OpenAI-style API (llama.cpp's llama-server, Microsoft's bitnet.cpp for ternary
+#            BitNet models, Ollama, LM Studio...). Set action_server to its address.
+#            PyKeet installs nothing for this; you start the server, PyKeet just asks it.
+action_server = "http://127.0.0.1:8080"
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true

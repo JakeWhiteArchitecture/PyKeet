@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "0.9"
+VERSION = "1.0"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -121,6 +121,11 @@ action_model = ""
 #         "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB, better, slower still). Models under ~0.5B
 #         (e.g. Gemma 3 270M) are usually too small to be reliable at this.
 action_backend = "zeroshot"
+# "server" = talk to a model you run yourself in a local server that speaks the common
+#            OpenAI-style API (llama.cpp's llama-server, Microsoft's bitnet.cpp for ternary
+#            BitNet models, Ollama, LM Studio...). Set action_server to its address.
+#            PyKeet installs nothing for this; you start the server, PyKeet just asks it.
+action_server = "http://127.0.0.1:8080"
 # Use a small name-recognition model (spaCy) for better names/places/companies in the
 # transcript viewer. Optional install, see README. Falls back to simple rules if missing.
 use_ner = true
@@ -165,6 +170,7 @@ DEFAULTS = {
     "highlight_actions": True,
     "action_model": "",
     "action_backend": "zeroshot",
+    "action_server": "http://127.0.0.1:8080",
     "ner_model": "en_core_web_md",
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
@@ -748,12 +754,75 @@ class LLMActionModel:
         return [scores_to_prediction(self._letter_logits(x)) for x in sentences]
 
 
-def get_action_model(name: str, backend: str = "zeroshot"):
-    key = (name, backend)
+class ServerActionModel:
+    """Asks a local model server (OpenAI-style /v1/completions) to pick the answer letter.
+    Works with any model the server runs, including ternary BitNet models via bitnet.cpp."""
+
+    def __init__(self, url: str, name: str = ""):
+        self.url = url.rstrip("/")
+        self.name = name
+        self._get("/health", fallback="/v1/models")  # raises if nothing is listening
+
+    def _get(self, path: str, fallback: str = "") -> None:
+        import urllib.request
+
+        try:
+            urllib.request.urlopen(self.url + path, timeout=3).read()
+        except Exception:
+            if not fallback:
+                raise
+            urllib.request.urlopen(self.url + fallback, timeout=3).read()
+
+    def _ask(self, sentence: str) -> tuple[str | None, float]:
+        import urllib.request
+
+        body = {"prompt": llm_prompt(sentence), "max_tokens": 1, "temperature": 0,
+                "logprobs": 6}
+        if self.name:
+            body["model"] = self.name
+        req = urllib.request.Request(self.url + "/v1/completions", json.dumps(body).encode(),
+                                     {"Content-Type": "application/json"})
+        choice = json.loads(urllib.request.urlopen(req, timeout=120).read())["choices"][0]
+        letters = parse_server_letters(choice)
+        if letters:
+            return scores_to_prediction(letters)
+        letter = (choice.get("text") or "").strip()[:1].upper()
+        return (LLM_LETTERS[letter], 0.75) if letter in LLM_LETTERS else (None, 0.0)
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        return [self._ask(x) for x in sentences]
+
+
+def parse_server_letters(choice: dict) -> dict[str, float] | None:
+    """Answer-letter log-probabilities from a server reply, if it sent them (the two common
+    shapes), else None. Needs at least two letters to be meaningful."""
+    lp = choice.get("logprobs") or {}
+    items: dict[str, float] = {}
+    top = None
+    if isinstance(lp.get("content"), list) and lp["content"]:
+        top = {t.get("token", ""): t.get("logprob", -99.0)
+               for t in lp["content"][0].get("top_logprobs", [])}
+    elif isinstance(lp.get("top_logprobs"), list) and lp["top_logprobs"]:
+        top = dict(lp["top_logprobs"][0])
+    for tok, val in (top or {}).items():
+        letter = tok.strip().upper()
+        if letter in LLM_LETTERS:
+            items[letter] = max(items.get(letter, -99.0), float(val))
+    if len(items) < 2:
+        return None
+    return {k: items.get(k, -30.0) for k in LLM_LETTERS}
+
+
+def get_action_model(name: str, backend: str = "zeroshot", server: str = ""):
+    key = (name, backend, server)
     if key not in _ACTION_MODELS:
         try:
-            _ACTION_MODELS[key] = (LLMActionModel(name) if backend == "llm"
-                                   else ActionModel(name))
+            if backend == "server":
+                _ACTION_MODELS[key] = ServerActionModel(server, name)
+            elif backend == "llm":
+                _ACTION_MODELS[key] = LLMActionModel(name)
+            else:
+                _ACTION_MODELS[key] = ActionModel(name)
             log.info("action detection: using %s model %s", backend, name)
         except Exception as exc:
             log.warning("action detection: could not load %s (%s: %s); using rules",
@@ -1787,7 +1856,9 @@ class Widget:
         render()
         status = tk.Label(win, text="", fg="#777", anchor="w")
         model_name = str(self.app.cfg.get("action_model") or "")
-        if markdown and model_name and self.app.cfg.get("highlight_actions"):
+        backend = str(self.app.cfg.get("action_backend") or "zeroshot")
+        if (markdown and self.app.cfg.get("highlight_actions")
+                and (model_name or backend == "server")):
             status.pack(side="bottom", fill="x", padx=10)
             status.configure(text="Analysing decisions and tasks with the AI model "
                                   "(the first time it downloads the model)…")
@@ -1795,8 +1866,8 @@ class Widget:
 
             def work():
                 try:
-                    model = get_action_model(model_name, str(self.app.cfg.get("action_backend")
-                                                             or "zeroshot"))
+                    model = get_action_model(model_name, backend,
+                                             str(self.app.cfg.get("action_server") or ""))
                     if model is None:
                         raise RuntimeError("model could not be loaded; see pykeet.log")
                     analyse_actions(body, model)

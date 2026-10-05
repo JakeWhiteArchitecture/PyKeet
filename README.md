@@ -131,7 +131,12 @@ file can't be read, a window shows the exact reason.
   `action_model = "Qwen/Qwen2.5-0.5B-Instruct"` (about 1 GB; understands wording better than the
   classifier but takes minutes on a long call; `Qwen2.5-1.5B-Instruct` is better and slower; models
   under ~0.5B such as Gemma 3 270M are usually too small to be reliable). It is shown worked examples
-  and picks an answer letter for each sentence. Treat both as a guide, not minutes: always check against the transcript.
+  and picks an answer letter for each sentence. You can also point PyKeet at a model server you run yourself:
+  `action_backend = "server"` and `action_server = "http://127.0.0.1:8080"` (llama.cpp's
+  `llama-server`, Ollama, LM Studio, or Microsoft's `bitnet.cpp` server for ternary BitNet models
+  such as BitNet b1.58 2B4T, which is about 0.4 GB and fast on a CPU but needs its own build, see its
+  README). PyKeet sends each sentence with the worked examples and reads the one-letter answer.
+  Treat both as a guide, not minutes: always check against the transcript.
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
