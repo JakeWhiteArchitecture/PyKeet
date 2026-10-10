@@ -175,6 +175,29 @@ typing near the mic.
 Notifications: on Linux (with `notify-send`) clicking "Open" opens the transcript. On Windows/macOS the
 tray notification cannot be clicked through, so use the tray's "Show last transcript".
 
+## Wayland / Fedora 43 (GNOME)
+
+Fedora 43 removes the X11 session, so apps can no longer listen for keys globally or press keys
+for you. PyKeet works around it (**written without access to a Wayland machine, so untested**):
+
+1. Start PyKeet as normal, then once run `python main.py --install-gnome-shortcuts`. GNOME now
+   owns the shortcuts (Settings > Keyboard > Custom Shortcuts) and runs
+   `python main.py --toggle-dictation` etc., which message the running PyKeet.
+   On other desktops, `python main.py --shortcut-commands` prints the commands to bind.
+2. Shortcuts are **press to start, press again to stop**. Hold-to-talk and the Esc cancel key
+   are not available on Wayland (Esc cannot be a global shortcut).
+3. Inserting text: PyKeet cannot press Ctrl+V for you, so it **copies the text and shows a
+   notification - press Ctrl+V**. For automatic typing, install `ydotool`, run its daemon, and
+   give yourself write access to `/dev/uinput` (udev rule); PyKeet then uses it automatically.
+4. Mic, file picker and notifications work as before. The floating pill runs through XWayland
+   and may not stay on top; the log and notifications are the reliable feedback.
+
+**Python on Fedora 43:** the system Python becomes 3.14, and your `.venv` (built on 3.13) will
+probably break. Rebuild it:
+`sudo dnf install python3.13 python3.13-tkinter`, then
+`python3.13 -m venv .venv && source .venv/bin/activate`, then the CPU-only torch command and
+`pip install -r requirements.txt` from the Install section.
+
 ## Autostart on login
 
 - **Windows:** `Win+R`, type `shell:startup`, add a shortcut to

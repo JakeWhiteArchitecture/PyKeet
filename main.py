@@ -13,6 +13,7 @@ import math
 import os
 import queue
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -33,7 +34,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.3"
+VERSION = "1.4"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -63,6 +64,12 @@ call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
 import_shortcut = "ctrl+alt+o"
 
+# On Wayland (Fedora 43 GNOME) apps cannot listen for keys globally. Run
+#   python main.py --install-gnome-shortcuts
+# once and GNOME itself will run PyKeet's shortcuts (toggle only: press to start, press to stop).
+# true = also try the old key listener on Wayland (only works for XWayland windows; usually useless).
+use_pynput_on_wayland = false
+
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
 dictation_mode = "toggle"
@@ -81,7 +88,10 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
-insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
+# "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
+# On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
+# it falls back to "clipboard" automatically and shows a notification. See README.
+insert_method = "paste"
 dictation_beep = false
 
 # Cut long silent pauses (e.g. you stop to think) before transcribing. Dictation only; calls,
@@ -191,6 +201,7 @@ DEFAULTS = {
     "input_device": "",
     "cleanup": True,
     "insert_method": "paste",
+    "use_pynput_on_wayland": False,
     "dictation_beep": False,
     "call_beep": True,
     "transcript_folder": "~/CallTranscripts",
@@ -1649,15 +1660,61 @@ def native_picker_command() -> list[str] | None:
     return None
 
 
-def insert_text(text: str, method: str) -> None:
+def is_wayland() -> bool:
+    return sys.platform.startswith("linux") and (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY")))
+
+
+def ydotool_ready() -> bool:
+    """ydotool installed, its daemon running and /dev/uinput writable (see README)."""
+    return bool(shutil.which("ydotool")) and os.access("/dev/uinput", os.W_OK)
+
+
+def insert_text(text: str, method: str, notify=None) -> None:
+    """Put text at the cursor. On Wayland, apps may not inject keys, so we use ydotool when it
+    is set up, otherwise leave the text on the clipboard and say so via notify(title, msg)."""
+    import pyperclip
+
+    wayland = is_wayland()
+    if wayland and method != "clipboard" and not ydotool_ready():
+        log.warning("Wayland: cannot press keys (ydotool not set up); text copied instead")
+        method = "clipboard"
+    if method == "clipboard":
+        pyperclip.copy(text)
+        if notify:
+            notify("PyKeet", "Copied - press Ctrl+V to paste")
+        return
+    if wayland:  # ydotool route
+        if method == "type":
+            subprocess.run(["ydotool", "type", "--", text], timeout=60, check=False)
+            return
+        old = None
+        try:
+            old = pyperclip.paste()
+        except Exception:
+            pass
+        pyperclip.copy(text)
+        time.sleep(0.1)
+        # key codes: 29 = left ctrl, 47 = v
+        subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], timeout=10,
+                       check=False)
+        if old is not None:
+            def restore_w():
+                try:
+                    pyperclip.copy(old)
+                except Exception:
+                    log.exception("clipboard restore failed")
+
+            threading.Timer(PASTE_RESTORE_SECONDS, restore_w).start()
+        return
+
     from pynput.keyboard import Controller, Key
 
     kb = Controller()
     if method == "type":
         kb.type(text)
         return
-    import pyperclip
-
     try:
         old = pyperclip.paste()
     except Exception:
@@ -1677,6 +1734,148 @@ def insert_text(text: str, method: str) -> None:
                 log.exception("clipboard restore failed")
 
         threading.Timer(PASTE_RESTORE_SECONDS, restore).start()
+
+
+# --------------------------------------------------------------------------
+# Remote control (Wayland has no global hotkeys for apps: the desktop runs
+# `python main.py --toggle-dictation` etc., which talks to the running copy)
+# --------------------------------------------------------------------------
+
+REMOTE_COMMANDS = {
+    "toggle-dictation": "toggle_dictation",
+    "toggle-call": "toggle_call",
+    "import": "request_file_picker",
+    "recall": "recall",
+    "cancel-dictation": "cancel_dictation",
+}
+
+
+def socket_path() -> str:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base or not os.path.isdir(base):
+        base = tempfile.gettempdir()
+    user = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
+    name = "pykeet.sock" if base == os.environ.get("XDG_RUNTIME_DIR") else f"pykeet-{user}.sock"
+    return os.path.join(base, name)
+
+
+def send_remote(cmd: str, path: str | None = None) -> str:
+    """Send one command to the running PyKeet; returns its reply. Raises OSError if none."""
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as c:
+        c.settimeout(5)
+        c.connect(path or socket_path())
+        c.sendall(cmd.encode() + b"\n")
+        return c.recv(200).decode().strip()
+
+
+class RemoteServer:
+    def __init__(self, app: "App", path: str | None = None):
+        self.app, self.path, self.sock = app, path or socket_path(), None
+
+    def start(self) -> None:
+        import socket as _socket
+
+        try:
+            os.unlink(self.path)  # stale file from a crash (we hold the single-instance lock)
+        except FileNotFoundError:
+            pass
+        self.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        self.sock.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.sock.listen(4)
+        threading.Thread(target=self._serve, daemon=True).start()
+        log.info("remote control socket: %s", self.path)
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.settimeout(2)
+                    cmd = conn.recv(200).decode().strip()
+                    conn.sendall((self.handle(cmd) + "\n").encode())
+                except Exception:
+                    log.debug("remote command failed", exc_info=True)
+
+    def handle(self, cmd: str) -> str:
+        method = REMOTE_COMMANDS.get(cmd)
+        if not method:
+            return "error unknown command"
+        log.info("remote command: %s", cmd)
+        self.app.post(getattr(self.app, method))
+        return "ok"
+
+    def stop(self) -> None:
+        try:
+            if self.sock:
+                self.sock.close()
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+# GNOME custom shortcuts -------------------------------------------------------
+
+GNOME_KEYS_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
+GNOME_CUSTOM_SCHEMA = GNOME_KEYS_SCHEMA + ".custom-keybinding"
+GNOME_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+# config key -> (command, label)
+SHORTCUT_COMMANDS = {
+    "dictation_shortcut": ("toggle-dictation", "PyKeet dictation"),
+    "call_shortcut": ("toggle-call", "PyKeet call recording"),
+    "import_shortcut": ("import", "PyKeet import audio file"),
+    "recall_shortcut": ("recall", "PyKeet paste last dictation"),
+}
+
+
+def gnome_binding(spec: str) -> str:
+    """'ctrl+alt+r' -> '<Control><Alt>r'"""
+    mods, main = parse_shortcut(spec)
+    names = {"ctrl": "<Control>", "alt": "<Alt>", "shift": "<Shift>", "cmd": "<Super>"}
+    return "".join(names[m] for m in ("ctrl", "alt", "shift", "cmd") if m in mods) + main
+
+
+def shortcut_command(cmd: str) -> str:
+    return " ".join(shlex.quote(p) for p in
+                    (sys.executable, str(Path(__file__).resolve()), "--" + cmd))
+
+
+def install_gnome_shortcuts(cfg: dict) -> None:
+    import ast
+
+    gs = shutil.which("gsettings")
+    if not gs:
+        sys.exit("gsettings not found - this only works on GNOME. Use --shortcut-commands to "
+                 "see the commands to bind by hand.")
+
+    def run(*a):
+        return subprocess.run([gs, *a], capture_output=True, text=True, check=True).stdout
+
+    existing = ast.literal_eval(run("get", GNOME_KEYS_SCHEMA, "custom-keybindings")
+                                .strip().replace("@as ", "") or "[]")
+    mine = [p for p in existing if "/pykeet-" in p]
+    paths = [p for p in existing if p not in mine]
+    for key, (cmd, label) in SHORTCUT_COMMANDS.items():
+        path = f"{GNOME_PATH}pykeet-{cmd}/"
+        schema = f"{GNOME_CUSTOM_SCHEMA}:{path}"
+        run("set", schema, "name", label)
+        run("set", schema, "command", shortcut_command(cmd))
+        run("set", schema, "binding", gnome_binding(cfg[key]))
+        paths.append(path)
+        print(f"  {cfg[key]:12} -> {label}")
+    run("set", GNOME_KEYS_SCHEMA, "custom-keybindings", repr(paths))
+    print("Done. GNOME now runs these shortcuts; PyKeet itself must be running.\n"
+          "Shortcuts are press-to-start / press-again-to-stop (no hold-to-talk on Wayland).")
+
+
+def print_shortcut_commands(cfg: dict) -> None:
+    for key, (cmd, label) in SHORTCUT_COMMANDS.items():
+        print(f"{label:30} {cfg[key]:12} {shortcut_command(cmd)}")
 
 
 # --------------------------------------------------------------------------
@@ -1841,8 +2040,11 @@ class Hotkeys:
 
     def start(self) -> None:
         log.info("session type: %s", os.environ.get("XDG_SESSION_TYPE", "unknown"))
-        if os.environ.get("XDG_SESSION_TYPE") == "wayland":
-            log.warning("Wayland session: global hotkeys will not work. Use an X11 session.")
+        if is_wayland() and not self.app.cfg["use_pynput_on_wayland"]:
+            log.warning("Wayland session: apps cannot listen for global keys. Run "
+                        "`python main.py --install-gnome-shortcuts` once (GNOME), or bind the "
+                        "commands from `python main.py --shortcut-commands` in your desktop.")
+            return
         try:
             from pynput import keyboard
 
@@ -2404,6 +2606,13 @@ class App:
         else:
             self.start_dictation()
 
+    def toggle_dictation(self) -> None:
+        """Press-to-start / press-to-stop whatever dictation_mode is (used by remote commands)."""
+        if self.mode == "dictation" and self.phase == "recording":
+            self.stop_dictation()
+        else:
+            self.start_dictation()
+
     def on_dictation_release(self) -> None:
         if self.cfg["dictation_mode"] == "push":
             self.stop_dictation()
@@ -2477,7 +2686,7 @@ class App:
                 self.ui("nospeech")
                 return
             self.last_text = text
-            insert_text(text, self.cfg["insert_method"])
+            insert_text(text, self.cfg["insert_method"], self.notify)
             self.ui("done")
         except Exception:
             log.exception("dictation failed")
@@ -2488,7 +2697,7 @@ class App:
     def recall(self) -> None:
         if self.last_text and self.mode == "idle":
             try:
-                insert_text(self.last_text, self.cfg["insert_method"])
+                insert_text(self.last_text, self.cfg["insert_method"], self.notify)
             except Exception:
                 log.exception("recall failed")
 
@@ -2816,6 +3025,8 @@ class App:
             self.recorder.stop()
         if self.hotkeys:
             self.hotkeys.stop()
+        if getattr(self, "remote", None):
+            self.remote.stop()
         if self.tray:
             self.tray.stop()
         self.engine.close()
@@ -2970,6 +3181,18 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--evaluate":
         evaluate()
         return
+    cmd = sys.argv[1][2:] if len(sys.argv) > 1 and sys.argv[1].startswith("--") else ""
+    if cmd in REMOTE_COMMANDS:
+        try:
+            reply = send_remote(cmd)
+        except OSError:
+            sys.exit("PyKeet is not running (no control socket). Start it first: python main.py")
+        sys.exit(0 if reply == "ok" else reply)
+    if cmd in ("install-gnome-shortcuts", "shortcut-commands"):
+        cfg = load_config()
+        (install_gnome_shortcuts if cmd == "install-gnome-shortcuts"
+         else print_shortcut_commands)(cfg)
+        return
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))
     log.info("PyKeet %s starting (python %s at %s)", VERSION, sys.version.split()[0],
@@ -2991,6 +3214,11 @@ def main() -> None:
     app.widget = Widget(app)
     app.hotkeys = Hotkeys(app)
     app.hotkeys.start()
+    app.remote = RemoteServer(app)
+    try:
+        app.remote.start()
+    except OSError:
+        log.exception("could not open the remote control socket")
     app.start_tray()
     app.load_in_background()
     try:

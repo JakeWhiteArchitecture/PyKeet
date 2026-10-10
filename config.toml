@@ -8,6 +8,12 @@ call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
 import_shortcut = "ctrl+alt+o"
 
+# On Wayland (Fedora 43 GNOME) apps cannot listen for keys globally. Run
+#   python main.py --install-gnome-shortcuts
+# once and GNOME itself will run PyKeet's shortcuts (toggle only: press to start, press to stop).
+# true = also try the old key listener on Wayland (only works for XWayland windows; usually useless).
+use_pynput_on_wayland = false
+
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
 dictation_mode = "toggle"
@@ -26,7 +32,10 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
-insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
+# "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
+# On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
+# it falls back to "clipboard" automatically and shows a notification. See README.
+insert_method = "paste"
 dictation_beep = false
 
 # Cut long silent pauses (e.g. you stop to think) before transcribing. Dictation only; calls,
