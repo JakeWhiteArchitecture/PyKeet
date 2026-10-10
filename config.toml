@@ -8,6 +8,12 @@ call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
 import_shortcut = "ctrl+alt+o"
 
+# On Wayland (Fedora 43 GNOME) apps cannot listen for keys globally. Run
+#   python main.py --install-gnome-shortcuts
+# once and GNOME itself will run PyKeet's shortcuts (toggle only: press to start, press to stop).
+# true = also try the old key listener on Wayland (only works for XWayland windows; usually useless).
+use_pynput_on_wayland = false
+
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
 dictation_mode = "toggle"
@@ -26,42 +32,76 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
-insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
+# "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
+# On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
+# it falls back to "clipboard" automatically and shows a notification. See README.
+insert_method = "paste"
 dictation_beep = false
 
-# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
-# false = use the basic built-in dialog.
-native_file_picker = true
-
-# --- Calls ---
-# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
-# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
-# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
-# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
-call_workers = 2
-# Dictation only (not calls, meetings or audio files): cut long silent pauses, e.g. when you
-# stop to think, before transcribing. A silence is only cut once speech has clearly resumed, and
-# `dictation_silence_keep_seconds` of quiet either side is kept so the first sound of returning
-# speech is never clipped.
+# Cut long silent pauses (e.g. you stop to think) before transcribing. Dictation only; calls,
+# meetings and audio files are never trimmed. A silence is only cut once speech has clearly
+# resumed, and `dictation_silence_keep_seconds` of quiet either side is kept so the first sound
+# of returning speech is never clipped.
 trim_dictation_silence = true
 dictation_silence_min_seconds = 2.0   # only silences at least this long are shortened
 dictation_silence_keep_seconds = 0.4  # quiet kept before and after the speech
 dictation_silence_threshold_db = 0    # 0 = automatic (adapts to your room noise); or e.g. -45
-# Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
-highlight_names = []
-highlight_companies = []
-# Use a small name-recognition model (spaCy) for better names/places/companies in the
-# transcript viewer. Optional install, see README. Falls back to simple rules if missing.
-use_ner = true
-# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
-# install; the other is the fallback.
-ner_model = "en_core_web_md"
---------------------------------------------------------------
+
+# --- Calls and audio files -------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
 keep_audio = false        # keep the call WAV next to the transcript
 label_speakers = true
 expected_speakers = 2     # 0 = detect automatically
+# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
+# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
+# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
+# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
+call_workers = 2
+# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
+# false = use the basic built-in dialog.
+native_file_picker = true
+
+# --- Transcript viewer: names and highlights --------------------------------
+# Always highlight these, e.g. ["Sarah Mitchell"].
+highlight_names = []
+highlight_companies = []
+# Use a small name-recognition model (spaCy) for better names/places/companies. Optional
+# install, see README. Falls back to simple rules if missing.
+use_ner = true
+# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
+# install; the other is the fallback.
+ner_model = "en_core_web_md"
+
+# --- Transcript viewer: decisions and tasks ---------------------------------
+# Underline sentences about decisions to make, options, decisions made, tasks to do and tasks
+# done, and offer an "Action summary" view. The built-in phrase rules are a rough guide only
+# (English). Optionally add an AI helper with action_backend, which decides how it is asked:
+highlight_actions = true
+#   "zeroshot"       small classifier model, needs `pip install transformers`; set action_model, e.g.
+#                    "MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33" (tiny) or
+#                    "typeform/distilbert-base-uncased-mnli" (bigger). Empty action_model = rules only.
+#   "llm"            small chat model run here, e.g. action_model = "Qwen/Qwen2.5-0.5B-Instruct"
+#                    (~1 GB, minutes on a long call) or "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB).
+#                    Models under ~0.5B (e.g. Gemma 3 270M) are usually too small to be reliable.
+#   "server"         a model you run in your own local server with the common OpenAI-style API
+#                    (llama.cpp's llama-server, Ollama, LM Studio, bitnet.cpp for ternary BitNet
+#                    models). Set action_server. PyKeet installs nothing for this.
+#   "needle"         Cactus Needle 3, a tiny (8-29 MB) tool-calling model on the CPU:
+#                    `pip install cactus-needle`. First use downloads the model and a small engine
+#                    library from Hugging Face. PyKeet switches off its anonymous usage pings.
+#   "phrases"        compare each sentence with the example phrases in action_phrases.toml using
+#                    word overlap. No install; improve it by adding your own phrases.
+#   "needle-phrases" the same phrase bank compared by MEANING with Needle 3's embeddings, so
+#                    different wording still matches (`pip install cactus-needle`).
+# Test any of them with:  python main.py --explain "a sentence"   (one sentence)
+#                         python main.py --evaluate               (50 labelled sentences, scores)
+action_backend = "zeroshot"
+action_model = ""
+action_server = "http://127.0.0.1:8080"
+# How alike a sentence must be to a phrase to count for the two "phrases" backends
+# (0 = automatic: 0.35 for "phrases", 0.55 for "needle-phrases"). Raise it for fewer false hits.
+phrase_min_similarity = 0
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.

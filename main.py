@@ -9,9 +9,11 @@ import logging
 import getpass
 import json
 import logging.handlers
+import math
 import os
 import queue
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -19,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from datetime import datetime
@@ -31,10 +34,11 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "0.8"
+VERSION = "1.4"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
+PHRASES_PATH = HERE / "action_phrases.toml"
 TMP_DIR = HERE / "tmp"  # temporary call WAVs live here
 
 SAMPLE_RATE = 16_000
@@ -60,6 +64,12 @@ call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
 import_shortcut = "ctrl+alt+o"
 
+# On Wayland (Fedora 43 GNOME) apps cannot listen for keys globally. Run
+#   python main.py --install-gnome-shortcuts
+# once and GNOME itself will run PyKeet's shortcuts (toggle only: press to start, press to stop).
+# true = also try the old key listener on Wayland (only works for XWayland windows; usually useless).
+use_pynput_on_wayland = false
+
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
 dictation_mode = "toggle"
@@ -78,42 +88,76 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
-insert_method = "paste"   # "paste" (clipboard + Ctrl+V) or "type"
+# "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
+# On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
+# it falls back to "clipboard" automatically and shows a notification. See README.
+insert_method = "paste"
 dictation_beep = false
 
-# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
-# false = use the basic built-in dialog.
-native_file_picker = true
-
-# --- Calls ---
-# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
-# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
-# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
-# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
-call_workers = 2
-# Dictation only (not calls, meetings or audio files): cut long silent pauses, e.g. when you
-# stop to think, before transcribing. A silence is only cut once speech has clearly resumed, and
-# `dictation_silence_keep_seconds` of quiet either side is kept so the first sound of returning
-# speech is never clipped.
+# Cut long silent pauses (e.g. you stop to think) before transcribing. Dictation only; calls,
+# meetings and audio files are never trimmed. A silence is only cut once speech has clearly
+# resumed, and `dictation_silence_keep_seconds` of quiet either side is kept so the first sound
+# of returning speech is never clipped.
 trim_dictation_silence = true
 dictation_silence_min_seconds = 2.0   # only silences at least this long are shortened
 dictation_silence_keep_seconds = 0.4  # quiet kept before and after the speech
 dictation_silence_threshold_db = 0    # 0 = automatic (adapts to your room noise); or e.g. -45
-# Always highlight these in the transcript viewer, e.g. ["Sarah Mitchell"].
-highlight_names = []
-highlight_companies = []
-# Use a small name-recognition model (spaCy) for better names/places/companies in the
-# transcript viewer. Optional install, see README. Falls back to simple rules if missing.
-use_ner = true
-# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
-# install; the other is the fallback.
-ner_model = "en_core_web_md"
---------------------------------------------------------------
+
+# --- Calls and audio files -------------------------------------------------
 call_beep = true
 transcript_folder = "~/CallTranscripts"
 keep_audio = false        # keep the call WAV next to the transcript
 label_speakers = true
 expected_speakers = 2     # 0 = detect automatically
+# How many call / audio-file transcriptions may run AT THE SAME TIME. Each runs on its own copy
+# of the model (costs RAM, and they share your CPU, so each is slower while they overlap); extra
+# jobs wait in a queue. Dictation always has its own separate model and only ever runs one
+# at a time. 0 = no extra copies: call jobs share the dictation model and dictation waits.
+call_workers = 2
+# Use the desktop's own file dialog for audio files (zenity on GNOME, kdialog on KDE).
+# false = use the basic built-in dialog.
+native_file_picker = true
+
+# --- Transcript viewer: names and highlights --------------------------------
+# Always highlight these, e.g. ["Sarah Mitchell"].
+highlight_names = []
+highlight_companies = []
+# Use a small name-recognition model (spaCy) for better names/places/companies. Optional
+# install, see README. Falls back to simple rules if missing.
+use_ner = true
+# "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
+# install; the other is the fallback.
+ner_model = "en_core_web_md"
+
+# --- Transcript viewer: decisions and tasks ---------------------------------
+# Underline sentences about decisions to make, options, decisions made, tasks to do and tasks
+# done, and offer an "Action summary" view. The built-in phrase rules are a rough guide only
+# (English). Optionally add an AI helper with action_backend, which decides how it is asked:
+highlight_actions = true
+#   "zeroshot"       small classifier model, needs `pip install transformers`; set action_model, e.g.
+#                    "MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33" (tiny) or
+#                    "typeform/distilbert-base-uncased-mnli" (bigger). Empty action_model = rules only.
+#   "llm"            small chat model run here, e.g. action_model = "Qwen/Qwen2.5-0.5B-Instruct"
+#                    (~1 GB, minutes on a long call) or "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB).
+#                    Models under ~0.5B (e.g. Gemma 3 270M) are usually too small to be reliable.
+#   "server"         a model you run in your own local server with the common OpenAI-style API
+#                    (llama.cpp's llama-server, Ollama, LM Studio, bitnet.cpp for ternary BitNet
+#                    models). Set action_server. PyKeet installs nothing for this.
+#   "needle"         Cactus Needle 3, a tiny (8-29 MB) tool-calling model on the CPU:
+#                    `pip install cactus-needle`. First use downloads the model and a small engine
+#                    library from Hugging Face. PyKeet switches off its anonymous usage pings.
+#   "phrases"        compare each sentence with the example phrases in action_phrases.toml using
+#                    word overlap. No install; improve it by adding your own phrases.
+#   "needle-phrases" the same phrase bank compared by MEANING with Needle 3's embeddings, so
+#                    different wording still matches (`pip install cactus-needle`).
+# Test any of them with:  python main.py --explain "a sentence"   (one sentence)
+#                         python main.py --evaluate               (50 labelled sentences, scores)
+action_backend = "zeroshot"
+action_model = ""
+action_server = "http://127.0.0.1:8080"
+# How alike a sentence must be to a phrase to count for the two "phrases" backends
+# (0 = automatic: 0.35 for "phrases", 0.55 for "needle-phrases"). Raise it for fewer false hits.
+phrase_min_similarity = 0
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
@@ -143,6 +187,11 @@ DEFAULTS = {
     "highlight_names": [],
     "highlight_companies": [],
     "use_ner": True,
+    "highlight_actions": True,
+    "action_model": "",
+    "action_backend": "zeroshot",
+    "action_server": "http://127.0.0.1:8080",
+    "phrase_min_similarity": 0,
     "ner_model": "en_core_web_md",
     "dictation_mode": "toggle",
     "model": "moondream/parakeet-redux",
@@ -152,6 +201,7 @@ DEFAULTS = {
     "input_device": "",
     "cleanup": True,
     "insert_method": "paste",
+    "use_pynput_on_wayland": False,
     "dictation_beep": False,
     "call_beep": True,
     "transcript_folder": "~/CallTranscripts",
@@ -169,12 +219,19 @@ def load_config() -> dict:
         CONFIG_PATH.write_text(CONFIG_TEMPLATE, encoding="utf-8")
     cfg = dict(DEFAULTS)
     try:
-        data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+        # Versions 0.7-1.1 wrote a stray line of dashes (not a comment) that made the whole
+        # file invalid TOML; drop it so such files still load.
+        text, fixed = re.subn(r"(?m)^-{10,}[ \t]*\n?", "", text)
+        if fixed:
+            print(f"Note: repaired a stray line in {CONFIG_PATH.name}", file=sys.stderr)
+        data = tomllib.loads(text)
         cfg.update(data)
         if data.get("parallel_workers") is False and "call_workers" not in data:
             cfg["call_workers"] = 0  # old setting
-    except Exception:
-        print(f"Could not read {CONFIG_PATH}; using defaults.", file=sys.stderr)
+    except Exception as exc:
+        print(f"Could not read {CONFIG_PATH}: {exc}\nUsing default settings; fix the line named "
+              f"above (or delete the file to start fresh).", file=sys.stderr)
         logging.getLogger("pykeet").exception("config read failed")
         cfg["replacements"] = {}
     return cfg
@@ -565,7 +622,537 @@ def find_entities(text: str, names=(), companies=(), ner: bool = False
     return sorted(taken)
 
 
-def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bool = False):
+ACTION_COLOURS = {  # underline colours (entities use background colours, so both can show)
+    "decision_open": "#e08a00", "option": "#c026d3", "decision_made": "#15803d",
+    "task_open": "#2563eb", "task_done": "#6b7280",
+}
+ACTION_LABELS = {"decision_open": "Decision to make", "option": "Options",
+                 "decision_made": "Decision made", "task_open": "Task to do",
+                 "task_done": "Task done"}
+
+SUMMARY_HEADINGS = {"decision_open": "Decisions to be made", "option": "Decision options available",
+                    "decision_made": "Decisions made", "task_open": "Tasks to be done",
+                    "task_done": "Tasks done"}
+
+_R = re.IGNORECASE
+_PEOPLE = r"(?:i|we|you|he|she|they)"
+_ACTION_RULES: list[tuple[str, re.Pattern]] = [  # first match wins, in this order
+    ("decision_made", re.compile(
+        r"\bwe(?:['’]ve| have)? (?:decided|agreed|settled|chosen|opted)\b"
+        r"|\b" + _PEOPLE + r"(?:['’]ll| will|['’]re going to| are going to| am going to|['’]m going to)"
+        r" go (?:with|for)\b"
+        r"|\blet['’]?s (?:go (?:with|for)|use|stick with|do it|run with|proceed with)\b"
+        r"|\b(?:that['’]?s|it['’]?s|this is) (?:agreed|settled|decided|confirmed|approved)\b"
+        r"|\bthe decision (?:is|was) (?:to|made)\b|\b(?:sticking|going) with\b"
+        r"|\bfinal (?:decision|choice)\b|\bsigned off\b|\bwe(?:['’]re| are) (?:going )?ahead with\b",
+        _R)),
+    ("task_done", re.compile(
+        r"\b" + _PEOPLE + r"(?:['’]ve| have| had)? (?:already |just |now |also )?"
+        r"(?:sent|submitted|emailed|finished|completed|issued|booked|arranged|ordered|paid|filed|"
+        r"uploaded|updated|fixed|signed|prepared|checked|chased|called|rung|posted|installed|"
+        r"delivered|dealt with|sorted|done)\b"
+        r"|\b(?:it['’]?s|that['’]?s|they['’]?re|all) (?:done|sorted|finished|complete|completed|"
+        r"submitted|booked|ordered|paid)\b"
+        r"|\b(?:has|have|had) been (?:sent|submitted|done|completed|issued|booked|ordered|paid)\b"
+        r"|\bwas (?:sent|submitted|issued|completed|done)\b", _R)),
+    ("option", re.compile(
+        r"\boption\s+(?:[abc]|one|two|three|\d)\b"
+        r"|\b(?:another|other|one|an|first|second|two|three)\s+(?:option|choice|alternative|way)s?\b"
+        r"|\balternatively\b|\beither\b[^.?!]*\bor\b"
+        r"|\b(?:could|can|might|may)\b[^.?!]*\bor (?:we|you|i)\s+(?:could|can|might|may)\b"
+        r"|\bon the other hand\b", _R)),
+    ("decision_open", re.compile(
+        r"\b" + _PEOPLE + r" (?:still )?(?:need|have|got|must|should) to (?:decide|choose|pick|"
+        r"settle|determine|agree|confirm which)\b"
+        r"|\b(?:need|needs|needing) (?:a )?decision\b|\bshould we\b|\bshall we\b"
+        r"|\bwhich (?:one|option|way|of)\b|\bwhether (?:to|or not)\b"
+        r"|\b(?:not|isn['’]?t|un)sure (?:if|whether|about|which)\b"
+        r"|\b(?:haven['’]?t|have not) (?:decided|chosen|agreed)\b|\byet to (?:decide|be decided)\b"
+        r"|\bto be decided\b|\bup in the air\b|\bup to you\b|\byour call\b", _R)),
+    ("task_open", re.compile(
+        r"\b" + _PEOPLE + r"(?:['’]ll| will| shall|['’]re going to| are going to|['’]m going to|"
+        r" am going to) (?!decide)\w+"
+        r"|\b" + _PEOPLE + r" (?:need|needs|have|has|must|should|ought) to (?!decide|choose)\w+"
+        r"|\b(?:can|could|would|will) you (?:please )?\w+|\bplease (?:send|make sure|let me|"
+        r"update|check|arrange|book|call|email|chase|prepare|issue|confirm|can|could)\b"
+        r"|\b(?:action point|to-?do|follow[- ]?up)\b|\bremind (?:me|us|you)\b|\bmake sure\b"
+        r"|\bdon['’]?t forget\b", _R)),
+]
+_SENTENCE = re.compile(r"[^.?!]+[.?!]*")
+
+
+_MODEL_KINDS: dict[str, str | None] = {}  # sentence -> kind decided by rules + AI model
+_ACTION_MODELS: dict[tuple, object] = {}
+ACTION_MODEL_LABELS = {
+    "decision_open": "a decision that still has to be made",
+    "option": "options or alternatives to choose between",
+    "decision_made": "a decision that has been made",
+    "task_open": "a task that someone has to do",
+    "task_done": "a task that has already been done",
+    None: "small talk or something else",
+}
+
+
+class ActionModel:
+    """Zero-shot sentence classifier (small NLI model via transformers). Optional."""
+
+    def __init__(self, name: str):
+        from transformers import pipeline  # ImportError if not installed
+
+        self.pipe = pipeline("zero-shot-classification", model=name, device=-1)
+        self.keys = list(ACTION_MODEL_LABELS)
+        self.labels = list(ACTION_MODEL_LABELS.values())
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        res = self.pipe(sentences, candidate_labels=self.labels,
+                        hypothesis_template="This is {}.", batch_size=16)
+        if isinstance(res, dict):
+            res = [res]
+        return [(self.keys[self.labels.index(r["labels"][0])], float(r["scores"][0]))
+                for r in res]
+
+
+LLM_LETTERS = dict(zip("ABCDEF", ACTION_MODEL_LABELS))  # A..E = kinds, F = none (None)
+LLM_PROMPT = """Classify each sentence from a meeting transcript.
+A = a decision that still has to be made
+B = options or alternatives to choose between
+C = a decision that has been made
+D = a task someone needs to do
+E = a task that has been done
+F = none of these (small talk, description, opinion)
+
+Sentence: We still need to decide whether to go with oak or larch.
+Answer: A
+
+Sentence: Option A is the single storey extension and option B adds a loft.
+Answer: B
+
+Sentence: So yeah I think we'll go larch.
+Answer: C
+
+Sentence: Somebody needs to chase the council about the beam.
+Answer: D
+
+Sentence: I've already sent the invoice to Sarah.
+Answer: E
+
+Sentence: The weather was awful on the day of the site visit.
+Answer: F
+
+Sentence: {sentence}
+Answer:"""
+
+
+def llm_prompt(sentence: str) -> str:
+    return LLM_PROMPT.format(sentence=" ".join(sentence.split()[:60]))
+
+
+def scores_to_prediction(letter_logits: dict[str, float]) -> tuple[str | None, float]:
+    """Softmax over the six answer letters -> (kind or None, probability)."""
+    top = max(letter_logits.values())
+    exps = {k: math.exp(v - top) for k, v in letter_logits.items()}
+    total = sum(exps.values())
+    best = max(exps, key=exps.get)
+    return LLM_LETTERS[best], exps[best] / total
+
+
+class LLMActionModel:
+    """Small instruct language model: show it examples, read which answer letter it prefers
+    (one forward pass per sentence, no free-text generation to parse). Optional."""
+
+    def __init__(self, name: str):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.torch = torch
+        self.tok = AutoTokenizer.from_pretrained(name)
+        self.model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32).eval()
+        self.ids = {}
+        for letter in LLM_LETTERS:
+            self.ids[letter] = {self.tok.encode(" " + letter, add_special_tokens=False)[-1],
+                                self.tok.encode(letter, add_special_tokens=False)[-1]}
+
+    def _letter_logits(self, sentence: str) -> dict[str, float]:
+        enc = self.tok(llm_prompt(sentence), return_tensors="pt")
+        with self.torch.no_grad():
+            logits = self.model(**enc).logits[0, -1]
+        return {letter: float(self.torch.logsumexp(logits[list(ids)], dim=0))
+                for letter, ids in self.ids.items()}
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        return [scores_to_prediction(self._letter_logits(x)) for x in sentences]
+
+
+# label -> (tool name shown to the model, description with an example)
+NEEDLE_TOOLS = {
+    "decision_open": ("decision_to_make",
+                      "A decision that has NOT been made yet: a question about what to choose, "
+                      "or something still to be decided. Example: 'should we use oak or larch?'"),
+    "option": ("options_available",
+               "Options or alternatives being listed to choose between. Example: 'option A is "
+               "a single storey extension, option B adds a loft.'"),
+    "decision_made": ("decision_made",
+                      "A decision that HAS been made or agreed. Example: 'we've decided to go "
+                      "with larch.'"),
+    "task_open": ("task_to_do",
+                  "A task or action someone has to do or has promised to do. Example: 'I'll "
+                  "send the drawings on Friday.'"),
+    "task_done": ("task_done",
+                  "A task that has ALREADY been completed. Example: 'I've sent the invoice to "
+                  "Sarah.'"),
+}
+
+
+class NeedleActionModel:
+    """Cactus Needle 3 (tiny tool-calling model). Each label is a tool; the tool it chooses for
+    a sentence is the label, an empty answer means 'neither'. Optional."""
+
+    def __init__(self):
+        os.environ["NEEDLE_TELEMETRY"] = "0"  # no usage pings: PyKeet stays local
+        import needle  # ImportError if cactus-needle is not installed
+
+        self.by_name = {name: kind for kind, (name, _doc) in NEEDLE_TOOLS.items()}
+        tools = []
+        for kind, (name, doc) in NEEDLE_TOOLS.items():
+            def fn(text: str):
+                return {}
+            fn.__name__ = fn.__qualname__ = name
+            fn.__doc__ = doc
+            tools.append(needle.tool(fn))
+        self.agent = needle.Needle(tools=tools, stateless=True, auto_date=False)
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        out = []
+        for sent in sentences:
+            resp = self.agent.complete(" ".join(sent.split()[:60]), 96)
+            calls = resp.get("function_calls") or []
+            if not calls:
+                out.append((None, 0.6))  # the model had nothing to say: let the rules decide
+                continue
+            kind = self.by_name.get(str(calls[0].get("name")))
+            if kind is None:
+                out.append((None, 0.0))  # not one of our tools: ignore, keep the rules' answer
+                continue
+            conf = resp.get("confidence")
+            out.append((kind, float(conf) if isinstance(conf, (int, float)) else 0.7))
+        return out
+
+
+PHRASE_LABELS = ["decision_open", "option", "decision_made", "task_open", "task_done", "none"]
+DEFAULT_PHRASES: dict[str, list[str]] = {
+    "decision_open": [
+        "we still need to decide which one to go for", "I'm not sure whether we should do it that way",
+        "we haven't decided yet", "which do you prefer", "what do you think we should do about this",
+        "it's up to you, you decide", "we need to make a decision on the windows",
+        "do you want it this way or that way", "we need to choose the finish",
+        "that's still to be decided", "shall we go ahead or wait", "I can't decide between the two"],
+    "option": [
+        "one option is to extend to the rear", "the other option would be to leave it as it is",
+        "we could do it this way or we could do it another way", "alternatively we could change the layout",
+        "option one is cheaper, option two looks better", "there are two ways of doing this",
+        "you could either keep the wall or take it out", "another possibility is a flat roof",
+        "choice a is timber, choice b is aluminium", "on the one hand it costs less, on the other hand it takes longer"],
+    "decision_made": [
+        "right, we've agreed on the brick", "that's decided then", "let's go with that",
+        "we're going ahead with the loft conversion", "we've settled on the second design",
+        "okay, we'll use the cheaper one", "the client has approved the scheme",
+        "we're sticking with the original plan", "I'm happy, let's do it",
+        "we've chosen the grey windows", "agreed, we'll do it that way", "we went with the first option in the end"],
+    "task_open": [
+        "I'll sort that out for you next week", "can you send me the details by tomorrow",
+        "I need to ring the builder about the quote", "we have to submit the application before the deadline",
+        "please remember to update the drawings", "somebody needs to follow that up",
+        "I'll get back to you on that", "he's going to email the engineer", "I'll put it in the diary",
+        "make sure you chase the council", "we need to book a site visit",
+        "can you check the dimensions and let me know"],
+    "task_done": [
+        "I've already emailed the drawings", "that's all been sent off", "we submitted the application last week",
+        "the builder has confirmed the date", "I booked the survey yesterday", "it's all sorted now",
+        "the invoice has been paid", "I finished the report this morning", "they've delivered the materials",
+        "that's done, ticked off the list", "we've got the approval back",
+        "I called the engineer and he's coming Tuesday"],
+    "none": [
+        "it was a lovely day when we visited", "the house has a big garden at the back", "yeah, mm, okay",
+        "the ceiling height is about two and a half metres", "I think the neighbours are quite friendly",
+        "how was your weekend", "sorry, can you say that again",
+        "the previous owner built the extension in the nineties", "it's quite a busy road outside",
+        "right, so that's the front elevation", "thanks very much for your time",
+        "I don't really know much about that"],
+}
+PHRASES_FILE_HEADER = """# Example phrases for each decision / task type, used by action_backend = "phrases" or
+# "needle-phrases". A sentence is given the type of the phrase it is most like. Add phrases from
+# your own meetings (natural speech works best) and delete ones that cause false hits. "none"
+# holds ordinary chat that should NOT count, which helps it tell the difference.
+"""
+
+
+def load_phrases() -> dict[str, list[str]]:
+    """Read action_phrases.toml (written with the defaults on first use)."""
+    if not PHRASES_PATH.exists():
+        lines = [PHRASES_FILE_HEADER]
+        for label in PHRASE_LABELS:
+            lines.append(f"[{label}]\nphrases = [")
+            lines += [f"  {json.dumps(p)}," for p in DEFAULT_PHRASES[label]]
+            lines.append("]\n")
+        try:
+            PHRASES_PATH.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            log.exception("could not write %s", PHRASES_PATH)
+    try:
+        data = tomllib.loads(PHRASES_PATH.read_text(encoding="utf-8"))
+        out = {k: [str(p) for p in data.get(k, {}).get("phrases", []) if str(p).strip()]
+               for k in PHRASE_LABELS}
+        if any(out[k] for k in PHRASE_LABELS if k != "none"):
+            return out
+    except Exception:
+        log.exception("could not read %s; using the built-in phrases", PHRASES_PATH)
+    return {k: list(v) for k, v in DEFAULT_PHRASES.items()}
+
+
+_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+class LexicalEmbedder:
+    """Word and word-pair overlap as a vector (no model): words that appear in many of the
+    bank's phrases count for less, so 'the' and 'we' matter less than 'decided' or 'sent'."""
+
+    DIM = 2048
+
+    def __init__(self, phrases: dict[str, list[str]]):
+        docs = [set(_WORD_RE.findall(p.lower())) for ps in phrases.values() for p in ps]
+        n = max(1, len(docs))
+        df: dict[str, int] = {}
+        for d in docs:
+            for w in d:
+                df[w] = df.get(w, 0) + 1
+        self.idf = {w: math.log(1 + n / c) for w, c in df.items()}
+        self.default_idf = math.log(1 + n)
+
+    def __call__(self, text: str) -> np.ndarray:
+        words = _WORD_RE.findall(text.lower())
+        vec = np.zeros(self.DIM, dtype=np.float32)
+        for i, w in enumerate(words):
+            weight = self.idf.get(w, 0.0)
+            vec[zlib.crc32(w.encode()) % self.DIM] += weight
+            if i + 1 < len(words):
+                vec[zlib.crc32((w + " " + words[i + 1]).encode()) % self.DIM] += 0.7 * weight
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm else vec
+
+
+class NeedleEmbedder:
+    """Meaning-based vectors from Needle 3's embedding head. Optional."""
+
+    def __init__(self):
+        os.environ["NEEDLE_TELEMETRY"] = "0"
+        import needle
+
+        self.agent = needle.Needle(stateless=True, auto_date=False)
+
+    def __call__(self, text: str) -> np.ndarray:
+        vec = np.asarray(self.agent.embed(text), dtype=np.float32)
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm else vec
+
+
+class PhraseActionModel:
+    """Label a sentence by the example phrase it is most like (cosine similarity)."""
+
+    def __init__(self, embed, phrases: dict[str, list[str]], min_sim: float, margin: float = 0.03):
+        self.embed, self.min_sim, self.margin = embed, min_sim, margin
+        self.labels: list[str] = []
+        self.texts: list[str] = []
+        vecs = []
+        for label, plist in phrases.items():
+            for p in plist:
+                self.labels.append(label)
+                self.texts.append(p)
+                vecs.append(embed(p))
+        self.matrix = np.stack(vecs)
+
+    def explain(self, sentence: str) -> list[tuple[str, float, str]]:
+        """Best phrase per label, best first: (label, similarity, phrase)."""
+        sims = self.matrix @ self.embed(sentence)
+        best: dict[str, tuple[float, str]] = {}
+        for label, sim, text in zip(self.labels, sims, self.texts):
+            if label not in best or sim > best[label][0]:
+                best[label] = (float(sim), text)
+        return sorted(((k, v[0], v[1]) for k, v in best.items()), key=lambda r: -r[1])
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        out = []
+        for sent in sentences:
+            ranked = self.explain(sent)
+            (label, sim, _), second = ranked[0], ranked[1][1]
+            if sim < self.min_sim:
+                out.append((None, 0.0))  # not like anything in the bank: leave it to the rules
+                continue
+            gap = sim - second
+            if label == "none":
+                out.append((None, 0.4 + min(0.4, gap * 3)))  # only a clear 'chat' removes a rule hit
+            else:
+                out.append((label, 0.55 + min(0.4, gap * 3) if gap >= self.margin else 0.45))
+        return out
+
+
+class ServerActionModel:
+    """Asks a local model server (OpenAI-style /v1/completions) to pick the answer letter.
+    Works with any model the server runs, including ternary BitNet models via bitnet.cpp."""
+
+    def __init__(self, url: str, name: str = ""):
+        self.url = url.rstrip("/")
+        self.name = name
+        self._get("/health", fallback="/v1/models")  # raises if nothing is listening
+
+    def _get(self, path: str, fallback: str = "") -> None:
+        import urllib.request
+
+        try:
+            urllib.request.urlopen(self.url + path, timeout=3).read()
+        except Exception:
+            if not fallback:
+                raise
+            urllib.request.urlopen(self.url + fallback, timeout=3).read()
+
+    def _ask(self, sentence: str) -> tuple[str | None, float]:
+        import urllib.request
+
+        body = {"prompt": llm_prompt(sentence), "max_tokens": 1, "temperature": 0,
+                "logprobs": 6}
+        if self.name:
+            body["model"] = self.name
+        req = urllib.request.Request(self.url + "/v1/completions", json.dumps(body).encode(),
+                                     {"Content-Type": "application/json"})
+        choice = json.loads(urllib.request.urlopen(req, timeout=120).read())["choices"][0]
+        letters = parse_server_letters(choice)
+        if letters:
+            return scores_to_prediction(letters)
+        letter = (choice.get("text") or "").strip()[:1].upper()
+        return (LLM_LETTERS[letter], 0.75) if letter in LLM_LETTERS else (None, 0.0)
+
+    def predict(self, sentences: list[str]) -> list[tuple[str | None, float]]:
+        return [self._ask(x) for x in sentences]
+
+
+def parse_server_letters(choice: dict) -> dict[str, float] | None:
+    """Answer-letter log-probabilities from a server reply, if it sent them (the two common
+    shapes), else None. Needs at least two letters to be meaningful."""
+    lp = choice.get("logprobs") or {}
+    items: dict[str, float] = {}
+    top = None
+    if isinstance(lp.get("content"), list) and lp["content"]:
+        top = {t.get("token", ""): t.get("logprob", -99.0)
+               for t in lp["content"][0].get("top_logprobs", [])}
+    elif isinstance(lp.get("top_logprobs"), list) and lp["top_logprobs"]:
+        top = dict(lp["top_logprobs"][0])
+    for tok, val in (top or {}).items():
+        letter = tok.strip().upper()
+        if letter in LLM_LETTERS:
+            items[letter] = max(items.get(letter, -99.0), float(val))
+    if len(items) < 2:
+        return None
+    return {k: items.get(k, -30.0) for k in LLM_LETTERS}
+
+
+def get_action_model(name: str, backend: str = "zeroshot", server: str = "",
+                     min_sim: float = 0.0):
+    key = (name, backend, server, min_sim)
+    if key not in _ACTION_MODELS:
+        try:
+            if backend in ("phrases", "needle-phrases"):
+                phrases = load_phrases()
+                lexical = backend == "phrases"
+                _ACTION_MODELS[key] = PhraseActionModel(
+                    LexicalEmbedder(phrases) if lexical else NeedleEmbedder(), phrases,
+                    float(min_sim) or (0.35 if lexical else 0.55))
+            elif backend == "needle":
+                _ACTION_MODELS[key] = NeedleActionModel()
+            elif backend == "server":
+                _ACTION_MODELS[key] = ServerActionModel(server, name)
+            elif backend == "llm":
+                _ACTION_MODELS[key] = LLMActionModel(name)
+            else:
+                _ACTION_MODELS[key] = ActionModel(name)
+            log.info("action detection: using %s model %s", backend, name)
+        except Exception as exc:
+            log.warning("action detection: could not load %s (%s: %s); using rules",
+                        name, type(exc).__name__, exc)
+            _ACTION_MODELS[key] = None
+    return _ACTION_MODELS[key]
+
+
+def combine_kind(rule_kind: str | None, model_kind: str | None, score: float) -> str | None:
+    """A confident model answer wins; a confident 'neither' removes a rule match; otherwise
+    fall back to the phrase rules."""
+    if model_kind is not None and score >= 0.5:
+        return model_kind
+    if model_kind is None and score >= 0.75:
+        return None
+    return rule_kind
+
+
+def transcript_sentences(md: str) -> list[str]:
+    out = []
+    for line in md.split("\n"):
+        m = re.match(r"^\[\d+:\d\d(?::\d\d)?\]\s*(?:\*\*.+?:\*\*)?\s*(.*)$", line)
+        if m:
+            out += [x.group().strip() for x in _SENTENCE.finditer(m.group(1))
+                    if len(x.group().split()) >= 4]
+    return out
+
+
+def analyse_actions(md: str, model) -> None:
+    """Run the AI model over every sentence once and remember the combined verdicts."""
+    todo = [x for x in dict.fromkeys(transcript_sentences(md)) if x not in _MODEL_KINDS]
+    for i in range(0, len(todo), 32):
+        chunk = todo[i:i + 32]
+        for sent, (mk, score) in zip(chunk, model.predict(chunk)):
+            _MODEL_KINDS[sent] = combine_kind(classify_sentence(sent), mk, score)
+
+
+def classify_sentence(sentence: str) -> str | None:
+    """Decision/task type of one sentence, or None. Phrase rules, English only."""
+    for kind, pat in _ACTION_RULES:
+        if pat.search(sentence):
+            return kind
+    return None
+
+
+def find_actions(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, kind) for each sentence of `text` that is about a decision or a task."""
+    out = []
+    for m in _SENTENCE.finditer(text):
+        sent = m.group()
+        if len(sent.split()) < 3:
+            continue
+        key = sent.strip()
+        kind = _MODEL_KINDS[key] if key in _MODEL_KINDS else classify_sentence(sent)
+        if kind:
+            out.append((m.start() + (len(sent) - len(sent.lstrip())), m.end(), kind))
+    return out
+
+
+def action_summary(md: str) -> str:
+    """Markdown list of every decision / option / task sentence in a transcript, by type."""
+    groups: dict[str, list[str]] = {k: [] for k in ACTION_LABELS}
+    for line in md.split("\n"):
+        m = re.match(r"^(\[\d+:\d\d(?::\d\d)?\])\s*(?:\*\*(.+?):\*\*)?\s*(.*)$", line)
+        if not m:
+            continue
+        ts, who, text = m.groups()
+        for a, b, kind in find_actions(text):
+            groups[kind].append(f"- {ts} " + (f"**{who}:** " if who else "") + text[a:b].strip())
+    out = ["# Action summary", ""]
+    for kind in ("decision_open", "option", "decision_made", "task_open", "task_done"):
+        out.append(f"## {SUMMARY_HEADINGS[kind]}")
+        out += groups[kind] or ["- (none found)"]
+        out.append("")
+    out.append("Found automatically: check against the transcript, some will be missed or wrong.")
+    return "\n".join(out)
+
+
+def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bool = False,
+                actions: bool = False):
     """Turn Markdown into [(text, tags)] for a Tk Text widget.
 
     Handles # / ## headings, '- ' bullets, **bold**, leading [mm:ss] timestamps, and (for
@@ -593,6 +1180,12 @@ def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bo
             plain += txt
             bold += [is_b] * len(txt)
         kinds = [None] * len(plain)
+        acts = [None] * len(plain)
+        if highlight and actions and not bullet and plain.strip():
+            detect_a = "".join(" " if bold[k] else plain[k] for k in range(len(plain)))
+            for a, b, kind in find_actions(detect_a):
+                for i in range(a, min(b, len(plain))):
+                    acts[i] = kind
         if highlight and not bullet and plain.strip():
             # bold text (the "Speaker 1:" label) is hidden from detection
             detect = "".join(" " if bold[k] else plain[k] for k in range(len(plain)))
@@ -602,9 +1195,11 @@ def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bo
         i = 0
         while i < len(plain):
             j = i
-            while j < len(plain) and bold[j] == bold[i] and kinds[j] == kinds[i]:
+            while (j < len(plain) and bold[j] == bold[i] and kinds[j] == kinds[i]
+                   and acts[j] == acts[i]):
                 j += 1
-            tags = (("bold",) if bold[i] else ()) + ((kinds[i],) if kinds[i] else ())
+            tags = ((("bold",) if bold[i] else ()) + ((kinds[i],) if kinds[i] else ())
+                    + ((acts[i],) if acts[i] else ()))
             out.append((plain[i:j], tags))
             i = j
         out.append(("\n", ()))
@@ -1065,15 +1660,61 @@ def native_picker_command() -> list[str] | None:
     return None
 
 
-def insert_text(text: str, method: str) -> None:
+def is_wayland() -> bool:
+    return sys.platform.startswith("linux") and (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY")))
+
+
+def ydotool_ready() -> bool:
+    """ydotool installed, its daemon running and /dev/uinput writable (see README)."""
+    return bool(shutil.which("ydotool")) and os.access("/dev/uinput", os.W_OK)
+
+
+def insert_text(text: str, method: str, notify=None) -> None:
+    """Put text at the cursor. On Wayland, apps may not inject keys, so we use ydotool when it
+    is set up, otherwise leave the text on the clipboard and say so via notify(title, msg)."""
+    import pyperclip
+
+    wayland = is_wayland()
+    if wayland and method != "clipboard" and not ydotool_ready():
+        log.warning("Wayland: cannot press keys (ydotool not set up); text copied instead")
+        method = "clipboard"
+    if method == "clipboard":
+        pyperclip.copy(text)
+        if notify:
+            notify("PyKeet", "Copied - press Ctrl+V to paste")
+        return
+    if wayland:  # ydotool route
+        if method == "type":
+            subprocess.run(["ydotool", "type", "--", text], timeout=60, check=False)
+            return
+        old = None
+        try:
+            old = pyperclip.paste()
+        except Exception:
+            pass
+        pyperclip.copy(text)
+        time.sleep(0.1)
+        # key codes: 29 = left ctrl, 47 = v
+        subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], timeout=10,
+                       check=False)
+        if old is not None:
+            def restore_w():
+                try:
+                    pyperclip.copy(old)
+                except Exception:
+                    log.exception("clipboard restore failed")
+
+            threading.Timer(PASTE_RESTORE_SECONDS, restore_w).start()
+        return
+
     from pynput.keyboard import Controller, Key
 
     kb = Controller()
     if method == "type":
         kb.type(text)
         return
-    import pyperclip
-
     try:
         old = pyperclip.paste()
     except Exception:
@@ -1093,6 +1734,148 @@ def insert_text(text: str, method: str) -> None:
                 log.exception("clipboard restore failed")
 
         threading.Timer(PASTE_RESTORE_SECONDS, restore).start()
+
+
+# --------------------------------------------------------------------------
+# Remote control (Wayland has no global hotkeys for apps: the desktop runs
+# `python main.py --toggle-dictation` etc., which talks to the running copy)
+# --------------------------------------------------------------------------
+
+REMOTE_COMMANDS = {
+    "toggle-dictation": "toggle_dictation",
+    "toggle-call": "toggle_call",
+    "import": "request_file_picker",
+    "recall": "recall",
+    "cancel-dictation": "cancel_dictation",
+}
+
+
+def socket_path() -> str:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base or not os.path.isdir(base):
+        base = tempfile.gettempdir()
+    user = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
+    name = "pykeet.sock" if base == os.environ.get("XDG_RUNTIME_DIR") else f"pykeet-{user}.sock"
+    return os.path.join(base, name)
+
+
+def send_remote(cmd: str, path: str | None = None) -> str:
+    """Send one command to the running PyKeet; returns its reply. Raises OSError if none."""
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as c:
+        c.settimeout(5)
+        c.connect(path or socket_path())
+        c.sendall(cmd.encode() + b"\n")
+        return c.recv(200).decode().strip()
+
+
+class RemoteServer:
+    def __init__(self, app: "App", path: str | None = None):
+        self.app, self.path, self.sock = app, path or socket_path(), None
+
+    def start(self) -> None:
+        import socket as _socket
+
+        try:
+            os.unlink(self.path)  # stale file from a crash (we hold the single-instance lock)
+        except FileNotFoundError:
+            pass
+        self.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        self.sock.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.sock.listen(4)
+        threading.Thread(target=self._serve, daemon=True).start()
+        log.info("remote control socket: %s", self.path)
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.settimeout(2)
+                    cmd = conn.recv(200).decode().strip()
+                    conn.sendall((self.handle(cmd) + "\n").encode())
+                except Exception:
+                    log.debug("remote command failed", exc_info=True)
+
+    def handle(self, cmd: str) -> str:
+        method = REMOTE_COMMANDS.get(cmd)
+        if not method:
+            return "error unknown command"
+        log.info("remote command: %s", cmd)
+        self.app.post(getattr(self.app, method))
+        return "ok"
+
+    def stop(self) -> None:
+        try:
+            if self.sock:
+                self.sock.close()
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+# GNOME custom shortcuts -------------------------------------------------------
+
+GNOME_KEYS_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
+GNOME_CUSTOM_SCHEMA = GNOME_KEYS_SCHEMA + ".custom-keybinding"
+GNOME_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+# config key -> (command, label)
+SHORTCUT_COMMANDS = {
+    "dictation_shortcut": ("toggle-dictation", "PyKeet dictation"),
+    "call_shortcut": ("toggle-call", "PyKeet call recording"),
+    "import_shortcut": ("import", "PyKeet import audio file"),
+    "recall_shortcut": ("recall", "PyKeet paste last dictation"),
+}
+
+
+def gnome_binding(spec: str) -> str:
+    """'ctrl+alt+r' -> '<Control><Alt>r'"""
+    mods, main = parse_shortcut(spec)
+    names = {"ctrl": "<Control>", "alt": "<Alt>", "shift": "<Shift>", "cmd": "<Super>"}
+    return "".join(names[m] for m in ("ctrl", "alt", "shift", "cmd") if m in mods) + main
+
+
+def shortcut_command(cmd: str) -> str:
+    return " ".join(shlex.quote(p) for p in
+                    (sys.executable, str(Path(__file__).resolve()), "--" + cmd))
+
+
+def install_gnome_shortcuts(cfg: dict) -> None:
+    import ast
+
+    gs = shutil.which("gsettings")
+    if not gs:
+        sys.exit("gsettings not found - this only works on GNOME. Use --shortcut-commands to "
+                 "see the commands to bind by hand.")
+
+    def run(*a):
+        return subprocess.run([gs, *a], capture_output=True, text=True, check=True).stdout
+
+    existing = ast.literal_eval(run("get", GNOME_KEYS_SCHEMA, "custom-keybindings")
+                                .strip().replace("@as ", "") or "[]")
+    mine = [p for p in existing if "/pykeet-" in p]
+    paths = [p for p in existing if p not in mine]
+    for key, (cmd, label) in SHORTCUT_COMMANDS.items():
+        path = f"{GNOME_PATH}pykeet-{cmd}/"
+        schema = f"{GNOME_CUSTOM_SCHEMA}:{path}"
+        run("set", schema, "name", label)
+        run("set", schema, "command", shortcut_command(cmd))
+        run("set", schema, "binding", gnome_binding(cfg[key]))
+        paths.append(path)
+        print(f"  {cfg[key]:12} -> {label}")
+    run("set", GNOME_KEYS_SCHEMA, "custom-keybindings", repr(paths))
+    print("Done. GNOME now runs these shortcuts; PyKeet itself must be running.\n"
+          "Shortcuts are press-to-start / press-again-to-stop (no hold-to-talk on Wayland).")
+
+
+def print_shortcut_commands(cfg: dict) -> None:
+    for key, (cmd, label) in SHORTCUT_COMMANDS.items():
+        print(f"{label:30} {cfg[key]:12} {shortcut_command(cmd)}")
 
 
 # --------------------------------------------------------------------------
@@ -1257,8 +2040,11 @@ class Hotkeys:
 
     def start(self) -> None:
         log.info("session type: %s", os.environ.get("XDG_SESSION_TYPE", "unknown"))
-        if os.environ.get("XDG_SESSION_TYPE") == "wayland":
-            log.warning("Wayland session: global hotkeys will not work. Use an X11 session.")
+        if is_wayland() and not self.app.cfg["use_pynput_on_wayland"]:
+            log.warning("Wayland session: apps cannot listen for global keys. Run "
+                        "`python main.py --install-gnome-shortcuts` once (GNOME), or bind the "
+                        "commands from `python main.py --shortcut-commands` in your desktop.")
+            return
         try:
             from pynput import keyboard
 
@@ -1442,6 +2228,7 @@ class Widget:
         win = tk.Toplevel(self.root)
         win.title(title)
         win.geometry("820x620")
+        win_font = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
         bar = tk.Frame(win)
         bar.pack(side="bottom", fill="x", padx=8, pady=6)
         if markdown:  # colour legend
@@ -1451,9 +2238,15 @@ class Widget:
             for kind, colour in ENTITY_COLOURS.items():
                 tk.Label(legend, text=ENTITY_LABELS[kind], bg=colour, fg="#111",
                          padx=6).pack(side="left", padx=3)
+            if self.app.cfg.get("highlight_actions"):
+                legend2 = tk.Frame(win)
+                legend2.pack(side="bottom", fill="x", padx=8, pady=(2, 0))
+                tk.Label(legend2, text="Underlined:").pack(side="left")
+                for kind, colour in ACTION_COLOURS.items():
+                    tk.Label(legend2, text=ACTION_LABELS[kind], fg=colour, padx=6,
+                             font=(win_font, 10, "underline")).pack(side="left", padx=3)
         frame = tk.Frame(win)
         frame.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 4))
-        win_font = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
         text = tk.Text(frame, wrap="word", font=(win_font, 11), padx=10, pady=8, spacing3=4,
                        undo=False)
         scroll = tk.Scrollbar(frame, command=text.yview)
@@ -1467,36 +2260,86 @@ class Widget:
         text.tag_configure("bullet", foreground="#555555")
         for kind, colour in ENTITY_COLOURS.items():
             text.tag_configure(kind, background=colour, foreground="#111111")
+        for kind, colour in ACTION_COLOURS.items():
+            text.tag_configure(kind, underline=True, underlinefg=colour)
         text.tag_raise("sel")
-        showing_raw = {"on": not markdown}
+        showing = {"mode": "raw" if not markdown else "formatted"}
 
         def render():
             text.configure(state="normal")
             text.delete("1.0", "end")
-            if showing_raw["on"]:
+            cfg = self.app.cfg
+            if showing["mode"] == "raw":
                 text.insert("1.0", body)
+            elif showing["mode"] == "summary":
+                for chunk, tags in md_segments(action_summary(body), highlight=False):
+                    text.insert("end", chunk, tags)
             else:
-                cfg = self.app.cfg
                 for chunk, tags in md_segments(body, cfg.get("highlight_names") or (),
                                                cfg.get("highlight_companies") or (),
-                                               ner=bool(cfg.get("use_ner"))):
+                                               ner=bool(cfg.get("use_ner")),
+                                               actions=bool(cfg.get("highlight_actions"))):
                     text.insert("end", chunk, tags)
             text.configure(state="disabled")  # read-only, but selecting/copying still works
 
         def copy():
             win.clipboard_clear()
-            win.clipboard_append(body)
+            win.clipboard_append(action_summary(body) if showing["mode"] == "summary" else body)
 
-        def toggle():
-            showing_raw["on"] = not showing_raw["on"]
-            raw_btn.configure(text="Show formatted" if showing_raw["on"] else "Show raw Markdown")
+        def set_mode(mode):
+            showing["mode"] = "formatted" if showing["mode"] == mode else mode
+            raw_btn.configure(text="Show formatted" if showing["mode"] == "raw"
+                              else "Show raw Markdown")
+            sum_btn.configure(text="Show formatted" if showing["mode"] == "summary"
+                              else "Action summary")
             render()
 
         render()
+        status = tk.Label(win, text="", fg="#777", anchor="w")
+        model_name = str(self.app.cfg.get("action_model") or "")
+        backend = str(self.app.cfg.get("action_backend") or "zeroshot")
+        if (markdown and self.app.cfg.get("highlight_actions")
+                and (model_name or backend in ("server", "needle", "phrases", "needle-phrases"))):
+            status.pack(side="bottom", fill="x", padx=10)
+            status.configure(text="Analysing decisions and tasks with the AI model "
+                                  "(the first time it downloads the model)…")
+            results: queue.Queue = queue.Queue()
+
+            def work():
+                try:
+                    model = get_action_model(model_name, backend,
+                                             str(self.app.cfg.get("action_server") or ""),
+                                             float(self.app.cfg.get("phrase_min_similarity") or 0))
+                    if model is None:
+                        raise RuntimeError("model could not be loaded; see pykeet.log")
+                    analyse_actions(body, model)
+                    results.put(None)
+                except Exception as exc:
+                    log.exception("action analysis failed")
+                    results.put(exc)
+
+            def poll():
+                if not win.winfo_exists():
+                    return
+                try:
+                    res = results.get_nowait()
+                except queue.Empty:
+                    win.after(300, poll)
+                    return
+                if res is None:
+                    status.configure(text="AI analysis done.")
+                    render()
+                else:
+                    status.configure(text=f"AI model unavailable ({res}); showing the phrase rules.")
+
+            threading.Thread(target=work, daemon=True).start()
+            win.after(300, poll)
         tk.Button(bar, text="Copy all", command=copy).pack(side="left")
-        raw_btn = tk.Button(bar, text="Show raw Markdown", command=toggle)
+        raw_btn = tk.Button(bar, text="Show raw Markdown", command=lambda: set_mode("raw"))
+        sum_btn = tk.Button(bar, text="Action summary", command=lambda: set_mode("summary"))
         if markdown:
             raw_btn.pack(side="left", padx=6)
+            sum_btn.pack(side="left", padx=0)
         if path:
             tk.Button(bar, text="Open file", command=lambda: open_path(path)).pack(
                 side="left", padx=6)
@@ -1763,6 +2606,13 @@ class App:
         else:
             self.start_dictation()
 
+    def toggle_dictation(self) -> None:
+        """Press-to-start / press-to-stop whatever dictation_mode is (used by remote commands)."""
+        if self.mode == "dictation" and self.phase == "recording":
+            self.stop_dictation()
+        else:
+            self.start_dictation()
+
     def on_dictation_release(self) -> None:
         if self.cfg["dictation_mode"] == "push":
             self.stop_dictation()
@@ -1836,7 +2686,7 @@ class App:
                 self.ui("nospeech")
                 return
             self.last_text = text
-            insert_text(text, self.cfg["insert_method"])
+            insert_text(text, self.cfg["insert_method"], self.notify)
             self.ui("done")
         except Exception:
             log.exception("dictation failed")
@@ -1847,7 +2697,7 @@ class App:
     def recall(self) -> None:
         if self.last_text and self.mode == "idle":
             try:
-                insert_text(self.last_text, self.cfg["insert_method"])
+                insert_text(self.last_text, self.cfg["insert_method"], self.notify)
             except Exception:
                 log.exception("recall failed")
 
@@ -2175,6 +3025,8 @@ class App:
             self.recorder.stop()
         if self.hotkeys:
             self.hotkeys.stop()
+        if getattr(self, "remote", None):
+            self.remote.stop()
         if self.tray:
             self.tray.stop()
         self.engine.close()
@@ -2201,7 +3053,146 @@ def check_dependencies() -> None:
                         ", ".join(missing), sys.executable, " ".join(missing))
 
 
+# Labelled sentences for `python main.py --evaluate` (none of them are in the phrase bank).
+# First 20 are clearly worded, the next 14 are messy natural speech, the last 16 are unseen.
+EVAL_SETS = {
+    "clear": [
+        ("decision_open", "We still need to decide whether to go with oak or larch for the cladding."),
+        ("decision_open", "Should we put the bifold doors on the garden side?"),
+        ("decision_open", "I'm not sure which one the client prefers."),
+        ("option", "Option A is the single storey extension, option B adds a loft conversion."),
+        ("option", "Alternatively we could split the kitchen and the utility."),
+        ("option", "We could go with brick or we could use render."),
+        ("decision_made", "We've decided to go with the larch cladding."),
+        ("decision_made", "Right, let's go with option B then."),
+        ("decision_made", "That's agreed, the windows are staying where they are."),
+        ("task_open", "I'll send the revised drawings over on Friday."),
+        ("task_open", "Can you please chase the structural engineer about the beam?"),
+        ("task_open", "We need to book the site visit before the end of the month."),
+        ("task_open", "Don't forget to update the planning statement."),
+        ("task_done", "I've already sent the invoice to Sarah."),
+        ("task_done", "The planning application has been submitted."),
+        ("task_done", "That's all done and sorted now."),
+        (None, "The weather was awful on the day of the site visit."),
+        (None, "Yeah, okay, mm."),
+        (None, "The roof is about three metres high at the ridge."),
+        (None, "It was a lovely house with a big garden and an old oak tree.")],
+    "messy": [
+        ("decision_made", "So yeah I think we'll go larch."),
+        ("decision_made", "Okay so we're doing the oak then."),
+        ("task_open", "Can we get the drawings to the engineer by Friday?"),
+        ("task_open", "He's going to ring you tomorrow about the quote."),
+        ("task_open", "Somebody needs to chase the council."),
+        ("task_done", "I sent it yesterday afternoon."),
+        ("task_done", "The engineer got back to us this morning."),
+        ("decision_open", "What do you reckon, brick or render?"),
+        ("decision_open", "Do you want the rooflight over the stairs or not?"),
+        ("option", "One way is to push the wall back, the other is to leave it."),
+        (None, "We should really get a coffee, it's been a long meeting."),
+        (None, "I will say the previous architect did a good job."),
+        (None, "We have to be careful with the neighbours."),
+        (None, "Please hold on a second while I find the plan.")],
+    "unseen": [
+        ("decision_open", "Do we want to keep the chimney or take it down?"),
+        ("decision_open", "I haven't made up my mind about the staircase yet."),
+        ("decision_open", "Which of the two layouts do you like better?"),
+        ("decision_made", "Fine, we'll use the oak flooring."),
+        ("decision_made", "The council has said yes so we're proceeding."),
+        ("option", "Either we widen the opening or we add a second door."),
+        ("option", "There's a cheaper route and a more expensive route."),
+        ("task_open", "I'll draw that up and send it to you."),
+        ("task_open", "Could you let the neighbour know about the scaffold?"),
+        ("task_open", "Someone has to measure the loft."),
+        ("task_done", "We paid the deposit on Monday."),
+        ("task_done", "I've updated the drawings already."),
+        (None, "The kitchen is at the back of the house."),
+        (None, "Lovely, thank you."),
+        (None, "It's about a twenty minute walk from the station."),
+        (None, "The old shed is falling apart.")],
+}
+
+
+def evaluate() -> None:
+    """`python main.py --evaluate`: score the configured detector on 50 labelled sentences."""
+    cfg = load_config()
+    logging.basicConfig(level=logging.WARNING)
+    backend = str(cfg.get("action_backend") or "zeroshot")
+    print(f"Backend: {backend}  model: {cfg.get('action_model') or '(none)'}")
+    model = get_action_model(str(cfg.get("action_model") or ""), backend,
+                             str(cfg.get("action_server") or ""),
+                             float(cfg.get("phrase_min_similarity") or 0))
+    if model is None:
+        print("(backend not available, see the warning above: showing the phrase rules only)")
+    flat = [(name, w, t) for name, rows in EVAL_SETS.items() for w, t in rows]
+    t0 = time.monotonic()
+    preds = model.predict([t for _n, _w, t in flat]) if model else [(None, 0.0)] * len(flat)
+    took = time.monotonic() - t0
+    tally: dict[str, list[int]] = {n: [0, 0, 0, 0] for n in EVAL_SETS}
+    misses = []
+    for (name, want, text), (mk, score) in zip(flat, preds):
+        rule = classify_sentence(text)
+        alone = mk if (mk is not None and score >= 0.5) or (mk is None and score >= 0.75) else None
+        both = combine_kind(rule, mk, score)
+        row = tally[name]
+        row[0] += 1
+        row[1] += rule == want
+        row[2] += alone == want
+        row[3] += both == want
+        if both != want:
+            misses.append((want, both, text))
+    print(f"\n{'set':8}{'n':>4}{'rules':>8}{'model':>8}{'combined':>10}")
+    total = [0, 0, 0, 0]
+    for name, row in tally.items():
+        print(f"{name:8}{row[0]:>4}{row[1]:>8}{row[2]:>8}{row[3]:>10}")
+        total = [a + b for a, b in zip(total, row)]
+    print(f"{'ALL':8}{total[0]:>4}{total[1]:>8}{total[2]:>8}{total[3]:>10}")
+    if model:
+        print(f"\nModel time: {took:.1f}s for {len(flat)} sentences ({took / len(flat):.2f}s each)")
+    print("\nStill wrong when combined (wanted -> got):")
+    for want, got, text in misses:
+        print(f"  {str(want):14} -> {str(got):14} {text}")
+
+
+def explain(sentence: str) -> None:
+    """`python main.py --explain "some sentence"`: show how the detector sees a sentence."""
+    cfg = load_config()
+    logging.basicConfig(level=logging.WARNING)
+    print(f"Sentence: {sentence}\nPhrase rules say: {classify_sentence(sentence)}")
+    backend = str(cfg.get("action_backend") or "zeroshot")
+    model = get_action_model(str(cfg.get("action_model") or ""), backend,
+                             str(cfg.get("action_server") or ""),
+                             float(cfg.get("phrase_min_similarity") or 0))
+    if model is None:
+        print(f"Backend '{backend}' is not available (see the warning above): rules only.")
+        return
+    if isinstance(model, PhraseActionModel):
+        print(f"Most similar phrase per type (needs >= {model.min_sim:g} to count):")
+        for label, sim, text in model.explain(sentence):
+            print(f"  {sim:5.2f}  {label:14} {text}")
+    kind, score = model.predict([sentence])[0]
+    print(f"Backend '{backend}' says: {kind} (confidence {score:.2f}); "
+          f"combined with the rules: {combine_kind(classify_sentence(sentence), kind, score)}")
+
+
 def main() -> None:
+    if len(sys.argv) > 2 and sys.argv[1] == "--explain":
+        explain(" ".join(sys.argv[2:]))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--evaluate":
+        evaluate()
+        return
+    cmd = sys.argv[1][2:] if len(sys.argv) > 1 and sys.argv[1].startswith("--") else ""
+    if cmd in REMOTE_COMMANDS:
+        try:
+            reply = send_remote(cmd)
+        except OSError:
+            sys.exit("PyKeet is not running (no control socket). Start it first: python main.py")
+        sys.exit(0 if reply == "ok" else reply)
+    if cmd in ("install-gnome-shortcuts", "shortcut-commands"):
+        cfg = load_config()
+        (install_gnome_shortcuts if cmd == "install-gnome-shortcuts"
+         else print_shortcut_commands)(cfg)
+        return
     cfg = load_config()
     setup_logging(bool(cfg["debug"]))
     log.info("PyKeet %s starting (python %s at %s)", VERSION, sys.version.split()[0],
@@ -2223,6 +3214,11 @@ def main() -> None:
     app.widget = Widget(app)
     app.hotkeys = Hotkeys(app)
     app.hotkeys.start()
+    app.remote = RemoteServer(app)
+    try:
+        app.remote.start()
+    except OSError:
+        log.exception("could not open the remote control socket")
     app.start_tray()
     app.load_in_background()
     try:

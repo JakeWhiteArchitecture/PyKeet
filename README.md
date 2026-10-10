@@ -120,6 +120,40 @@ file can't be read, a window shows the exact reason.
   `pip install spacy` then `python -m spacy download en_core_web_md` (use `en_core_web_sm` for the
   12 MB version). PyKeet uses it automatically (`use_ner = true`) and falls back to the simple rules if
   it is missing. It is still a statistical guess and will occasionally mislabel something.
+- **Decisions and tasks.** The viewer underlines sentences about a decision to make (amber), options
+  (magenta), a decision made (green), a task to do (blue) and a task done (grey), and "Action summary"
+  lists them all by type with their timestamps. By default this uses simple phrase rules (English):
+  good on clear wording ("we've decided to go with larch", "I'll send the drawings"), poor on natural
+  speech ("so yeah we'll go larch"). For better results set `action_model` in `config.toml` to a small
+  zero-shot AI model, e.g. `MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33` (needs
+  `pip install transformers`; downloads once; runs in the background after the viewer opens, with the
+  rules shown straight away). A small chat language model can be used instead: `action_backend = "llm"` with
+  `action_model = "Qwen/Qwen2.5-0.5B-Instruct"` (about 1 GB; understands wording better than the
+  classifier but takes minutes on a long call; `Qwen2.5-1.5B-Instruct` is better and slower; models
+  under ~0.5B such as Gemma 3 270M are usually too small to be reliable). It is shown worked examples
+  and picks an answer letter for each sentence. **Needle 3** (Cactus Compute, Apache-2.0) is the lightest option: a tiny 8-29 MB tool-calling model
+  that runs on the CPU and installs with almost nothing (`pip install cactus-needle`). Set
+  `action_backend = "needle"`. Each label becomes a "tool" and the model picks one per sentence (or
+  none). Good to know: the first use downloads the model and a small native engine library from
+  Hugging Face (after that it works offline), and the package would send anonymous usage pings by
+  default, which PyKeet switches off (`NEEDLE_TELEMETRY=0`). It is built for phone-style tool calls, so
+  test it on a real transcript before trusting it.
+**Teach it with example phrases.** `action_backend = "phrases"` compares each sentence with the example
+  phrases in `action_phrases.toml` (created on first use with about a dozen per type plus a "none" group of
+  ordinary chat; edit it freely and add phrases from your own meetings). With no install it matches by
+  word overlap: on my 50-sentence check it lifted messy speech from 4/14 to 8/14 when combined with the
+  rules, with one more false hit, so it is a modest help. `action_backend = "needle-phrases"` compares the
+  same phrases by *meaning* using Needle 3's embeddings (so "we'll go larch" can match "let's go with
+  that"); that one is untested on real speech. See why a sentence got its label with To compare backends or models on your own machine, set `action_backend` /
+  `action_model` and run `python main.py --evaluate`: it scores the rules, the model alone and the two
+  combined on 50 labelled sentences, shows the time per sentence and lists what is still wrong.
+  `python main.py --explain "so yeah I think we'll go larch"`.
+You can also point PyKeet at a model server you run yourself:
+  `action_backend = "server"` and `action_server = "http://127.0.0.1:8080"` (llama.cpp's
+  `llama-server`, Ollama, LM Studio, or Microsoft's `bitnet.cpp` server for ternary BitNet models
+  such as BitNet b1.58 2B4T, which is about 0.4 GB and fast on a CPU but needs its own build, see its
+  README). PyKeet sends each sentence with the worked examples and reads the one-letter answer.
+  Treat both as a guide, not minutes: always check against the transcript.
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
@@ -140,6 +174,29 @@ typing near the mic.
 
 Notifications: on Linux (with `notify-send`) clicking "Open" opens the transcript. On Windows/macOS the
 tray notification cannot be clicked through, so use the tray's "Show last transcript".
+
+## Wayland / Fedora 43 (GNOME)
+
+Fedora 43 removes the X11 session, so apps can no longer listen for keys globally or press keys
+for you. PyKeet works around it (**written without access to a Wayland machine, so untested**):
+
+1. Start PyKeet as normal, then once run `python main.py --install-gnome-shortcuts`. GNOME now
+   owns the shortcuts (Settings > Keyboard > Custom Shortcuts) and runs
+   `python main.py --toggle-dictation` etc., which message the running PyKeet.
+   On other desktops, `python main.py --shortcut-commands` prints the commands to bind.
+2. Shortcuts are **press to start, press again to stop**. Hold-to-talk and the Esc cancel key
+   are not available on Wayland (Esc cannot be a global shortcut).
+3. Inserting text: PyKeet cannot press Ctrl+V for you, so it **copies the text and shows a
+   notification - press Ctrl+V**. For automatic typing, install `ydotool`, run its daemon, and
+   give yourself write access to `/dev/uinput` (udev rule); PyKeet then uses it automatically.
+4. Mic, file picker and notifications work as before. The floating pill runs through XWayland
+   and may not stay on top; the log and notifications are the reliable feedback.
+
+**Python on Fedora 43:** the system Python becomes 3.14, and your `.venv` (built on 3.13) will
+probably break. Rebuild it:
+`sudo dnf install python3.13 python3.13-tkinter`, then
+`python3.13 -m venv .venv && source .venv/bin/activate`, then the CPU-only torch command and
+`pip install -r requirements.txt` from the Install section.
 
 ## Autostart on login
 
