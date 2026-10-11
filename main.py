@@ -61,7 +61,7 @@ dictation_shortcut = "ctrl+space"
 recall_shortcut = "f8"
 cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
-# Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
+# Opens the audio file picker (mp3/ogg/flac/wav)
 import_shortcut = "ctrl+alt+o"
 # Read the selected (or copied) text aloud in a proofreading window - see "Proofreading" below
 proofread_shortcut = "ctrl+alt+p"
@@ -1813,6 +1813,9 @@ REMOTE_COMMANDS = {
     "recall": "recall",
     "cancel-dictation": "cancel_dictation",
     "proofread": "proofread_selection",
+    "show-last": "show_last",
+    "pause": "_toggle_pause",
+    "quit": "quit",
 }
 
 
@@ -2915,7 +2918,6 @@ class App:
         self.engine = Engine(cfg)
         self.recorder = Recorder(cfg["input_device"])
         self.widget: Widget | None = None
-        self.tray = None
         self.hotkeys: Hotkeys | None = None
         self.lock = threading.RLock()
         self.mode = "idle"       # "idle" | "dictation" | "call"
@@ -2960,7 +2962,6 @@ class App:
             self._status_notify(state)
         if self.widget:
             self.widget.send(state)
-        self._refresh_tray()
 
     @property
     def bg_busy(self) -> bool:
@@ -3014,7 +3015,6 @@ class App:
         self.bg_note = (f" ({n} jobs)" if n > 1 else (self._disp["note"] if self._disp else ""))
         if self.widget:
             self.widget.q.put(("bg", self.bg_phase or "none"))
-        self._refresh_tray()
 
     def progress(self) -> float | None:
         """Estimated fraction done for the shown job's current phase (from audio length and
@@ -3027,7 +3027,6 @@ class App:
     def _set_idle(self) -> None:
         with self.lock:
             self.mode, self.phase = "idle", "none"
-        self._refresh_tray()
 
     def _arm_timer(self, seconds: float, fn) -> None:
         self._cancel_timer()
@@ -3512,7 +3511,7 @@ class App:
         except Exception:
             log.exception("could not remove/move temp WAV")
 
-    # -- tray / notifications -------------------------------------------------------
+    # -- notifications -------------------------------------------------------
     def notify(self, title: str, message: str, open_file: Path | None = None) -> None:
         def work():
             try:
@@ -3524,52 +3523,10 @@ class App:
                     out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                     if open_file and out.stdout.strip() == "open":
                         open_path(open_file)
-                elif self.tray is not None:
-                    self.tray.notify(message, title)
             except Exception:
                 log.debug("notification failed", exc_info=True)
 
         threading.Thread(target=work, daemon=True).start()
-
-    def _refresh_tray(self) -> None:
-        if self.tray is not None:
-            try:
-                self.tray.update_menu()
-            except Exception:
-                pass
-
-    def start_tray(self) -> None:
-        try:
-            import pystray
-            from PIL import Image, ImageDraw
-        except Exception:
-            log.warning("pystray/Pillow not available; running without a tray icon")
-            return
-
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse((4, 4, 60, 60), fill=(30, 30, 36, 255))
-        d.rounded_rectangle((24, 12, 40, 38), radius=8, fill=(240, 240, 245, 255))
-        d.arc((16, 24, 48, 50), 0, 180, fill=(240, 240, 245, 255), width=3)
-        d.line((32, 50, 32, 56), fill=(240, 240, 245, 255), width=3)
-
-        def call_label(_item):
-            return "Stop call" if self.mode == "call" and self.phase == "recording" \
-                else "Start call"
-
-        menu = pystray.Menu(
-            pystray.MenuItem(call_label, lambda: self.post(self.toggle_call)),
-            pystray.MenuItem("Transcribe audio file…",
-                             lambda: self.post(self.request_file_picker)),
-            pystray.MenuItem("Pause dictation", self._toggle_pause,
-                             checked=lambda _i: self.paused),
-            pystray.MenuItem("Show last transcript", lambda: self.post(self.show_last)),
-            pystray.MenuItem("Open call transcripts", lambda: self.post(self.open_folder)),
-            pystray.MenuItem("Open config", lambda: open_path(CONFIG_PATH)),
-            pystray.MenuItem("Quit", lambda: self.post(self.quit)),
-        )
-        self.tray = pystray.Icon("pykeet", img, "PyKeet", menu)
-        self.tray.run_detached()
 
     def _toggle_pause(self, *_a) -> None:
         self.paused = not self.paused
@@ -3611,8 +3568,6 @@ class App:
             self.remote.stop()
         if self.portal:
             self.portal.close()
-        if self.tray:
-            self.tray.stop()
         self.engine.close()
         self.ui("quit")
 
@@ -3625,7 +3580,6 @@ def check_dependencies() -> None:
         ("REQUIRED", [("moondream", "moondream"), ("numpy", "numpy"),
                       ("sounddevice", "sounddevice"), ("pynput", "pynput"),
                       ("pyperclip", "pyperclip")]),
-        ("optional (tray icon + file picker)", [("pystray", "pystray"), ("PIL", "Pillow")]),
         ("optional (audio file import)", [("soundfile", "soundfile"), ("scipy", "scipy")]),
         ("optional (speaker labels)", [("diarize", "diarize")]),
         ("optional (smarter name highlighting)", [("spacy", "spacy")]),
@@ -3804,7 +3758,6 @@ def main() -> None:
     except OSError:
         log.exception("could not open the remote control socket")
     app.start_portals()
-    app.start_tray()
     app.load_in_background()
     try:
         app.widget.run()  # tkinter must own the main thread

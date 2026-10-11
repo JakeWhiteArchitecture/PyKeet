@@ -5,7 +5,7 @@ dictation_shortcut = "ctrl+space"
 recall_shortcut = "f8"
 cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
-# Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
+# Opens the audio file picker (mp3/ogg/flac/wav)
 import_shortcut = "ctrl+alt+o"
 # Read the selected (or copied) text aloud in a proofreading window - see "Proofreading" below
 proofread_shortcut = "ctrl+alt+p"

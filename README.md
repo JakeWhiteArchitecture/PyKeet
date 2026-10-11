@@ -7,7 +7,7 @@ No cloud, no account, no word limits.
 - **Call mode:** press `Ctrl+Alt+R` at the start of a speakerphone call and again at the end. A timestamped, speaker-labelled Markdown transcript is saved to `~/CallTranscripts/`.
 
 > **Status:** the pure logic (text cleanup, replacements, speaker assignment, transcript format,
-> crash-recovery of WAVs) is tested. The hotkeys, widget, tray, microphone and model calls need a real
+> crash-recovery of WAVs) is tested. The hotkeys, widget, microphone and model calls need a real
 > desktop, so run the acceptance tests in the spec on your own machine before relying on it.
 > One assumption to check first: the exact layout of Parakeet's `timestamps="word"` result
 > (`extract_units()` in `main.py` accepts words at top level, words inside segments, or plain segments).
@@ -24,7 +24,7 @@ python -m venv .venv
 pip install --no-cache-dir torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
 
 pip install --no-cache-dir -r requirements.txt            # core: dictation + calls
-pip install --no-cache-dir -r requirements-optional.txt   # tray icon, file import, speaker labels
+pip install --no-cache-dir -r requirements-optional.txt   # file import, speaker labels, name highlighting, Wayland portals, voices
 python main.py
 ```
 
@@ -42,7 +42,7 @@ the same terminal/venv you installed into.
 Linux also needs system packages. Debian/Ubuntu: `sudo apt install python3-tk xclip libportaudio2 libnotify-bin`.
 Fedora: `sudo dnf install python3-tkinter xclip portaudio libnotify`.
 `config.toml` is created next to `main.py` on first run. The first start loads the model (a download
-the first time, then fully offline); the tray shows "Ready." when it is done.
+the first time, then fully offline); the floating pill and a notification say when it is ready.
 
 **Quit Vibe Typer first.** Both apps want `Ctrl+Space`.
 
@@ -54,14 +54,15 @@ the first time, then fully offline); the tray shows "Ready." when it is done.
 | `F8` | Re-insert the last dictation |
 | `Esc` while recording | Discard |
 | `Ctrl+Alt+R` | Start / stop call recording |
-| `Ctrl+Alt+O` | Open the audio file picker (same as the tray item) |
+| `Ctrl+Alt+O` | Open the audio file picker  |
 
 Widget: click while dictating = stop and insert, right-click = cancel. It is draggable and remembers its
-position. During a call it shows "CALL" and ignores clicks; stop with the shortcut or the tray menu.
+position. During a call it shows "CALL" and ignores clicks; stop with the shortcut.
 While a call is being recorded the dictation shortcut is disabled.
 
-Tray menu: Start/Stop call, Transcribe audio file…, Pause dictation, Show last transcript (opens the latest call transcript),
-Open call transcripts, Open config, Quit.
+There is no tray icon. Other actions are commands you can bind to a shortcut or run in a terminal:
+`python main.py --show-last` (open the latest call transcript), `--pause` (pause/resume dictation),
+`--quit`, `--import`, `--toggle-call`, `--toggle-dictation`.
 
 ## Config
 
@@ -75,7 +76,7 @@ first time you record a call).
 
 ## Transcribing an audio file
 
-Tray menu > **Transcribe audio file…** (or `Ctrl+Alt+O`, handy if your desktop has no tray) opens your desktop's own file dialog (via `zenity` on GNOME, `kdialog` on KDE, so you get your usual sidebar
+**Ctrl+Alt+O** (or `python main.py --import`) opens your desktop's own file dialog (via `zenity` on GNOME, `kdialog` on KDE, so you get your usual sidebar
 and bookmarks; on Fedora `sudo dnf install zenity` if it is missing; set `native_file_picker = false` to use the
 basic built-in dialog) for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
 several to batch them). Each file is decoded to 16 kHz mono, transcribed with the call settings
@@ -108,7 +109,7 @@ file can't be read, a window shows the exact reason.
   is never clipped; shorter pauses are untouched. A silence is only cut once speech has clearly resumed
   after it, and the level adapts to your room noise (set `dictation_silence_threshold_db` to a number like
   `-45` to override). Calls, meetings and imported audio files are **not** trimmed.
-- **Transcript viewer.** Imported files, and tray > Show last transcript, open a small Markdown viewer
+- **Transcript viewer.** Imported files, and `--show-last`, open a small Markdown viewer
   (headings, bold speaker names, grey timestamps). Names / proper nouns (blue), phone numbers (green),
   addresses and postcodes (orange), companies (purple) and emails (teal) are coloured. This is
   rule-based guesswork, not AI: it will miss some and mark some places or products as names. Add anyone
@@ -173,7 +174,7 @@ For better call audio: phone right next to the mic, quiet room, ideally a USB co
 typing near the mic.
 
 Notifications: on Linux (with `notify-send`) clicking "Open" opens the transcript. On Windows/macOS the
-tray notification cannot be clicked through, so use the tray's "Show last transcript".
+notification cannot be clicked through, so run `python main.py --show-last`.
 
 ## Wayland / Fedora 43 (GNOME)
 
@@ -209,7 +210,7 @@ Set `wayland_portals = true` in `config.toml` and `pip install jeepney`. Then:
   remove those custom shortcuts first (Settings > Keyboard) or each key fires twice.
 - **Feedback:** the floating pill runs through XWayland and may not show or stay on top. With
   `wayland_status_notifications = true` you get small "Recording / Transcribing / Done"
-  notifications instead. GNOME has no tray icon without an extension; use the shortcuts.
+  notifications instead. PyKeet has no tray icon.
 - Anything the desktop refuses falls back to the Stage 1 behaviour, and the reason is in the log.
 
 ## Proofreading: have the text read back to you
