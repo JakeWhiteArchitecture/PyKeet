@@ -104,8 +104,8 @@ _SPEAKER_LOCK = threading.Lock()
 
 
 def get_speaker(cfg: dict, models_dir: Path, note=None):
-    """The best available speaker for cfg['tts_engine'] ("auto", "kokoro", "piper", "espeak"),
-    or None to mean "use the espeak command line". Cached after the first call."""
+    """The best available speaker for cfg['tts_engine'] ("auto", "kokoro", "piper"),
+    or None if neither is installed/usable. Cached after the first call."""
     global _SPEAKER, _SPEAKER_KEY
     engine = str(cfg["tts_engine"]).lower()
     key = (engine, cfg["kokoro_model"], cfg["kokoro_voice"], cfg["piper_voice"])
@@ -113,7 +113,7 @@ def get_speaker(cfg: dict, models_dir: Path, note=None):
         if _SPEAKER_KEY == key:
             return _SPEAKER
         order = {"auto": [KokoroSpeaker, PiperSpeaker], "kokoro": [KokoroSpeaker, PiperSpeaker],
-                 "piper": [PiperSpeaker], "espeak": []}.get(engine, [KokoroSpeaker, PiperSpeaker])
+                 "piper": [PiperSpeaker]}.get(engine, [KokoroSpeaker, PiperSpeaker])
         speaker = None
         for cls in order:
             try:
@@ -176,7 +176,7 @@ class AudioCache:
 
 class Playback:
     """Plays samples through sounddevice; looks like a subprocess (poll/terminate/wait) so the
-    proofreader can stop it the same way as an espeak process."""
+    proofreader can stop it the same way as a subprocess."""
 
     def __init__(self, samples: np.ndarray, sr: int):
         import sounddevice as sd

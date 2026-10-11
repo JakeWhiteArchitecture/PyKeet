@@ -226,13 +226,12 @@ not pasted straight away. A window shows it: **Enter** reads it back to you (and
 mistakes), **Esc** pastes it and closes. Turn off with `review_long_dictation = false`.
 If GNOME refuses to give that window keyboard focus, click it once.
 
-**Voices** (`tts_engine = "auto"` tries them in this order; models download on first use into
+**Voices** (`tts_engine = "auto"` tries Kokoro then Piper; install at least one; models download on first use into
 `tts-models/`):
 1. **Kokoro** - the most natural. `pip install kokoro-onnx`. About 120 MB of models and
    0.5-1 GB RAM while speaking (tested here: ~400 MB, int8 model, faster than real time).
    Change voice with `kokoro_voice` (UK: bf_emma, bf_isabella, bm_george, bm_lewis).
 2. **Piper** - lighter, flatter. `pip install piper-tts`. `piper_noise_scale` makes it livelier.
-3. **espeak-ng** - robotic, nothing to download: `sudo dnf install espeak-ng`.
 
 Word-level flags use estimated word timings (the voice doesn't report them), so a flag can land
 a word either side. Piper's download and voices were not tested here; Kokoro was.

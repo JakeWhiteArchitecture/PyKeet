@@ -176,12 +176,11 @@ phrase_min_similarity = 0
 # sounds wrong to flag the word being spoken. P = pause, Left/Right = back/skip.
 # Long dictations are offered for read-back automatically (see review_* below).
 #
-# Voice engine: "auto" = Kokoro, else Piper, else the espeak-ng command. Models download the
-# first time they are used (into the tts-models folder). Optional installs:
+# Voice engine: "auto" = Kokoro, else Piper. Models download the first time they are used
+# (into the tts-models folder). Install at least one:
 #   pip install kokoro-onnx     (livelier, ~120 MB of models, ~0.5-1 GB RAM while speaking)
 #   pip install piper-tts       (lighter, ~60 MB voice)
-#   sudo dnf install espeak-ng  (robotic, but nothing to download)
-tts_engine = "auto"              # "auto", "kokoro", "piper" or "espeak"
+tts_engine = "auto"              # "auto", "kokoro" or "piper"
 kokoro_voice = "bf_emma"         # bf_emma bf_isabella bm_george bm_lewis (UK); af_heart am_adam (US)
 kokoro_lang = "en-gb"            # "en-gb" or "en-us"
 kokoro_speed = 1.0               # 0.8 = slower
@@ -190,8 +189,6 @@ piper_voice = "en_GB-alan-medium"
 piper_speed = 1.05               # > 1 is slower
 piper_noise_scale = 0.8          # higher = livelier pitch (0.667 is Piper's default; > 1 gets wobbly)
 piper_noise_w = 0.9              # higher = less regular rhythm
-proofread_speed = 170            # espeak only: words per minute
-proofread_voice = ""             # espeak only, e.g. "en-gb"
 proofread_phrase_words = 14      # longest phrase read at once (smaller = more precise flags)
 # You react a moment after you hear a mistake, so the flag goes to the word spoken this many
 # seconds before you pressed Space.
@@ -233,8 +230,6 @@ DEFAULTS = {
     "piper_noise_w": 0.9,
     "review_long_dictation": True,
     "review_min_sentences": 3,
-    "proofread_speed": 170,
-    "proofread_voice": "",
     "proofread_phrase_words": 14,
     "proofread_reaction_seconds": 0.5,
     "wayland_portals": False,
@@ -2187,27 +2182,6 @@ def split_phrases(text: str, max_words: int = 14) -> list[tuple[int, int]]:
     return out
 
 
-def tts_command(text: str, speed: int, voice: str):
-    """(argv, stdin_text, env) to speak text with whatever speech tool exists, or None."""
-    if sys.platform == "darwin" and shutil.which("say"):
-        argv = ["say", "-r", str(speed)] + (["-v", voice] if voice else [])
-        return argv, text, None
-    if sys.platform.startswith("win"):
-        ps = ("Add-Type -AssemblyName System.Speech;$s=New-Object System.Speech.Synthesis."
-              "SpeechSynthesizer;$s.Rate=%d;$s.Speak($env:PYKEET_SAY)"
-              % max(-10, min(10, (speed - 170) // 15)))
-        return (["powershell", "-NoProfile", "-Command", ps], None,
-                {**os.environ, "PYKEET_SAY": text})
-    for exe in ("espeak-ng", "espeak"):
-        if shutil.which(exe):
-            return ([exe, "--stdin", "-s", str(speed)] + (["-v", voice] if voice else []),
-                    text, None)
-    if shutil.which("spd-say"):
-        rate = max(-100, min(100, (speed - 170) // 2))
-        return ["spd-say", "-w", "-r", str(rate), "--", text], None, None
-    return None
-
-
 def selected_text() -> str:
     """The text the user has selected, else what is on the clipboard."""
     def run(argv):
@@ -2602,7 +2576,7 @@ class Widget:
                         tts_state["cache"] = tts.AudioCache(speaker)
                         tts_state["tts"] = tts
                 except Exception:
-                    log.exception("embedded speech unavailable; using espeak")
+                    log.exception("embedded speech unavailable")
                     sess.note = ""
             cache = tts_state["cache"]
             if cache:
@@ -2620,21 +2594,7 @@ class Widget:
                 sess.began_playing()
                 pb.wait()
                 return
-            cmd = tts_command(phrase, int(cfg["proofread_speed"]), str(cfg["proofread_voice"]))
-            if not cmd:
-                raise RuntimeError("no voice found: pip install kokoro-onnx, or "
-                                   "sudo dnf install espeak-ng")
-            argv, stdin_text, env = cmd
-            sess.proc = subprocess.Popen(
-                argv, stdin=subprocess.PIPE if stdin_text is not None else None,
-                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            sess.began_playing()
-            if stdin_text is not None:
-                try:
-                    sess.proc.communicate(stdin_text.encode("utf-8"))
-                except OSError:
-                    pass
-            sess.proc.wait()
+            raise RuntimeError("no voice installed - run: pip install kokoro-onnx")
 
         sess = ProofSession(text, speak, lambda **kw: events.put(kw),
                             int(cfg["proofread_phrase_words"]),
@@ -3136,9 +3096,10 @@ class App:
             if not text.strip():
                 self.notify("PyKeet", "Nothing selected. Select some text (or copy it) first.")
                 return
-            if not tts_command("x", 170, ""):
-                self.notify("PyKeet", "No text-to-speech program found. "
-                                      "Install one: sudo dnf install espeak-ng")
+            import importlib.util
+
+            if not any(importlib.util.find_spec(m) for m in ("kokoro_onnx", "piper")):
+                self.notify("PyKeet", "No voice installed. Run: pip install kokoro-onnx")
                 return
             if self.widget:
                 self.widget.q.put(("proof", text))
