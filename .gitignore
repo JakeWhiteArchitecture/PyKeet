@@ -1,3 +1,5 @@
 __pycache__/
 pykeet.log*
 tmp/
+tts-models/
+.portal-restore-token

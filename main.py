@@ -34,7 +34,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.5"
+VERSION = "1.6"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -173,14 +173,34 @@ phrase_min_similarity = 0
 # --- Proofreading (read text aloud, flag what sounds wrong) -------------------
 # Select text anywhere and press proofread_shortcut (on Wayland: select it, or copy it with
 # Ctrl+C first). A window reads it to you one short phrase at a time. Press SPACE when something
-# sounds wrong to flag that phrase. P = pause, Left/Right = back/skip. Uses espeak-ng
-# (sudo dnf install espeak-ng), else speech-dispatcher's spd-say; `say` on macOS.
-proofread_speed = 170            # words per minute
-proofread_voice = ""             # e.g. "en-gb" for espeak-ng; empty = default
+# sounds wrong to flag the word being spoken. P = pause, Left/Right = back/skip.
+# Long dictations are offered for read-back automatically (see review_* below).
+#
+# Voice engine: "auto" = Kokoro, else Piper, else the espeak-ng command. Models download the
+# first time they are used (into the tts-models folder). Optional installs:
+#   pip install kokoro-onnx     (livelier, ~120 MB of models, ~0.5-1 GB RAM while speaking)
+#   pip install piper-tts       (lighter, ~60 MB voice)
+#   sudo dnf install espeak-ng  (robotic, but nothing to download)
+tts_engine = "auto"              # "auto", "kokoro", "piper" or "espeak"
+kokoro_voice = "bf_emma"         # bf_emma bf_isabella bm_george bm_lewis (UK); af_heart am_adam (US)
+kokoro_lang = "en-gb"            # "en-gb" or "en-us"
+kokoro_speed = 1.0               # 0.8 = slower
+kokoro_model = "int8"            # "int8" (92 MB), "fp16" (177 MB), "full" (326 MB, best)
+piper_voice = "en_GB-alan-medium"
+piper_speed = 1.05               # > 1 is slower
+piper_noise_scale = 0.8          # higher = livelier pitch (0.667 is Piper's default; > 1 gets wobbly)
+piper_noise_w = 0.9              # higher = less regular rhythm
+proofread_speed = 170            # espeak only: words per minute
+proofread_voice = ""             # espeak only, e.g. "en-gb"
 proofread_phrase_words = 14      # longest phrase read at once (smaller = more precise flags)
-# You react a moment after you hear a mistake; a flag pressed within this many seconds of a
-# phrase starting goes to the PREVIOUS phrase.
-proofread_reaction_seconds = 0.6
+# You react a moment after you hear a mistake, so the flag goes to the word spoken this many
+# seconds before you pressed Space.
+proofread_reaction_seconds = 0.5
+
+# When a dictation is this many sentences or longer, show it in a window first instead of
+# pasting straight away:  Enter = read it back to me (and flag mistakes),  Esc = paste it now.
+review_long_dictation = true
+review_min_sentences = 3
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
@@ -202,10 +222,21 @@ DEFAULTS = {
     "call_shortcut": "ctrl+alt+r",
     "import_shortcut": "ctrl+alt+o",
     "proofread_shortcut": "ctrl+alt+p",
+    "tts_engine": "auto",
+    "kokoro_voice": "bf_emma",
+    "kokoro_lang": "en-gb",
+    "kokoro_speed": 1.0,
+    "kokoro_model": "int8",
+    "piper_voice": "en_GB-alan-medium",
+    "piper_speed": 1.05,
+    "piper_noise_scale": 0.8,
+    "piper_noise_w": 0.9,
+    "review_long_dictation": True,
+    "review_min_sentences": 3,
     "proofread_speed": 170,
     "proofread_voice": "",
     "proofread_phrase_words": 14,
-    "proofread_reaction_seconds": 0.6,
+    "proofread_reaction_seconds": 0.5,
     "wayland_portals": False,
     "wayland_status_notifications": True,
     "native_file_picker": True,
@@ -2224,11 +2255,11 @@ def selected_text() -> str:
 
 
 class ProofSession:
-    """Reads phrases one after another and records which ones the user flagged.
+    """Reads phrases one after another and records which words the user flagged.
     No GUI in here: on_change() is called whenever the position or flags change."""
 
     def __init__(self, text: str, speak, on_change, max_words: int = 14,
-                 reaction_s: float = 0.6):
+                 reaction_s: float = 0.5):
         self.text = text
         self.spans = split_phrases(text, max_words)
         self.speak = speak          # speak(phrase_text, session) blocks until spoken/killed
@@ -2236,7 +2267,9 @@ class ProofSession:
         self.reaction_s = reaction_s
         self.cur = -1
         self.next = 0
-        self.flags: set[int] = set()
+        self.flags: set[tuple[int, int]] = set()   # (start, end) character spans
+        self.words: dict[int, list] = {}           # phrase -> [(a, b, t0, t1)] when known
+        self.note = ""                             # e.g. "Downloading voice…"
         self.paused = False
         self.finished = False
         self.proc = None
@@ -2250,6 +2283,13 @@ class ProofSession:
     def phrase(self, i: int) -> str:
         a, b = self.spans[i]
         return self.text[a:b]
+
+    def set_words(self, i: int, words: list) -> None:
+        self.words[i] = words
+
+    def began_playing(self) -> None:
+        """Called by the speaker when the sound actually starts."""
+        self._started_at = time.monotonic()
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -2269,11 +2309,10 @@ class ProofSession:
             self.on_change()
             try:
                 self.speak(self.phrase(i), self)
-            except Exception:
+            except Exception as exc:
                 log.exception("speech failed")
                 self.stop()
-                self.on_change(error="Could not speak. Install espeak-ng "
-                                     "(sudo dnf install espeak-ng).")
+                self.on_change(error=f"Could not speak: {exc}")
                 return
         self.finished = not self._stop
         self.on_change()
@@ -2287,15 +2326,29 @@ class ProofSession:
                 pass
 
     def flag(self) -> None:
-        """Flag what is being read - or the phrase before it if the press is so soon after a
-        phrase started that you were clearly reacting to the previous one."""
+        """Flag the word you just heard (or the phrase, if word timings are unknown)."""
         with self._lock:
             i = self.cur
             if i < 0:
                 return
-            if time.monotonic() - self._started_at < self.reaction_s and i > 0:
-                i -= 1
-            self.flags.symmetric_difference_update({i})
+            elapsed = time.monotonic() - self._started_at
+            t = elapsed - self.reaction_s
+            words = self.words.get(i)
+            span = None
+            if words:
+                if t < 0 and i > 0 and self.words.get(i - 1):
+                    prev = self.words[i - 1]
+                    span = (prev[-1][0], prev[-1][1])
+                elif t < 0:
+                    span = (words[0][0], words[0][1])
+                else:
+                    hit = next((w for w in words if w[2] <= t < w[3]), words[-1])
+                    span = (hit[0], hit[1])
+            else:
+                if elapsed < self.reaction_s and i > 0:
+                    i -= 1
+                span = self.spans[i]
+            self.flags.symmetric_difference_update({span})
         self.on_change()
 
     def toggle_pause(self) -> None:
@@ -2323,19 +2376,29 @@ class ProofSession:
         self._go.set()
         self._kill()
 
+    def _context(self, a: int, b: int) -> str:
+        i = next((k for k, (x, y) in enumerate(self.spans) if x <= a < y), None)
+        if i is None:
+            return self.text[a:b]
+        x, y = self.spans[i]
+        return f"{self.text[x:a]}\u00ab{self.text[a:b]}\u00bb{self.text[b:y]}".strip()
+
     def flagged_report(self) -> str:
         if not self.flags:
             return "Nothing flagged."
-        return "\n".join(f"- {self.phrase(i)}" for i in sorted(self.flags))
+        return "\n".join(f"- {self._context(a, b)}" for a, b in sorted(self.flags))
 
     def marked_text(self, marker: str = "[CHECK] ") -> str:
         out, last = [], 0
-        for i in sorted(self.flags):
-            a, b = self.spans[i]
+        for a, _b in sorted(self.flags):
             out += [self.text[last:a], marker]
             last = a
         out.append(self.text[last:])
         return "".join(out)
+
+
+def count_sentences(text: str) -> int:
+    return len([p for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p])
 
 
 # --------------------------------------------------------------------------
@@ -2447,7 +2510,7 @@ class Widget:
                 if isinstance(item, tuple) and item[0] == "text":
                     self._show_text(*item[1:])  # (title, body, path, markdown)
                 elif isinstance(item, tuple) and item[0] == "proof":
-                    self._show_proof(item[1])
+                    self._show_proof(*item[1:])  # (text, review_cb or None)
                 elif isinstance(item, tuple) and item[0] == "bg":
                     self.bgs = item[1]
                     self._apply()
@@ -2493,15 +2556,17 @@ class Widget:
         self._draw()
         self.root.update_idletasks()
 
-    def _show_proof(self, text: str) -> None:
-        """Proofreading window: reads the text aloud phrase by phrase; SPACE flags a phrase."""
+    def _show_proof(self, text: str, review_cb=None) -> None:
+        """Proofreading window: reads the text aloud phrase by phrase; SPACE flags the word being
+        spoken. With review_cb (a long dictation) it first asks: Enter = read it back,
+        Esc = paste it now; closing the window in any way pastes it via review_cb."""
         tk = self.tk
         cfg = self.app.cfg
         win = tk.Toplevel(self.root)
-        win.title("PyKeet proofreading")
+        win.title("PyKeet - dictation ready" if review_cb else "PyKeet proofreading")
         win.geometry("760x560")
         font = ("Segoe UI" if sys.platform.startswith("win") else "Helvetica", 13)
-        status = tk.Label(win, anchor="w", text="Starting…")
+        status = tk.Label(win, anchor="w", text="Starting…", justify="left", wraplength=720)
         status.pack(side="top", fill="x", padx=8, pady=(8, 0))
         bar = tk.Frame(win)
         bar.pack(side="bottom", fill="x", padx=8, pady=6)
@@ -2515,19 +2580,55 @@ class Widget:
         box.insert("1.0", text)
         box.tag_configure("now", background="#fff3a8")
         box.tag_configure("flag", background="#ffb3b3", underline=True)
-        box.tag_raise("now")
+        box.tag_raise("flag")
         box.configure(state="disabled")
 
         events: queue.Queue = queue.Queue()
+        tts_state: dict = {"tried": False, "cache": None}
 
         def speak(phrase, sess):
+            if not tts_state["tried"]:
+                tts_state["tried"] = True
+                try:
+                    import tts
+
+                    def note(msg):
+                        sess.note = msg
+                        sess.on_change()
+
+                    speaker = tts.get_speaker(cfg, HERE / "tts-models", note)
+                    sess.note = ""
+                    if speaker:
+                        tts_state["cache"] = tts.AudioCache(speaker)
+                        tts_state["tts"] = tts
+                except Exception:
+                    log.exception("embedded speech unavailable; using espeak")
+                    sess.note = ""
+            cache = tts_state["cache"]
+            if cache:
+                tts = tts_state["tts"]
+                me = sess.cur
+                samples, sr = cache.get(phrase)
+                if me + 1 < len(sess.spans):
+                    cache.prefetch(sess.phrase(me + 1))
+                if sess.next != me + 1 or sess._stop:
+                    return  # skipped or paused while this was being prepared
+                pb = tts.Playback(samples, sr)
+                sess.proc = pb
+                sess.set_words(me, tts.word_spans(phrase, sess.spans[me][0], pb.duration))
+                pb.start()
+                sess.began_playing()
+                pb.wait()
+                return
             cmd = tts_command(phrase, int(cfg["proofread_speed"]), str(cfg["proofread_voice"]))
             if not cmd:
-                raise RuntimeError("no text-to-speech program found")
+                raise RuntimeError("no voice found: pip install kokoro-onnx, or "
+                                   "sudo dnf install espeak-ng")
             argv, stdin_text, env = cmd
             sess.proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE if stdin_text is not None else None,
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sess.began_playing()
             if stdin_text is not None:
                 try:
                     sess.proc.communicate(stdin_text.encode("utf-8"))
@@ -2540,7 +2641,10 @@ class Widget:
                             float(cfg["proofread_reaction_seconds"]))
         if not sess.spans:
             win.destroy()
+            if review_cb:
+                review_cb()
             return
+        started = {"yes": not review_cb}
 
         def idx(pos):
             return f"1.0+{pos}c"
@@ -2548,8 +2652,7 @@ class Widget:
         def refresh(error=None):
             box.tag_remove("now", "1.0", "end")
             box.tag_remove("flag", "1.0", "end")
-            for i in sess.flags:
-                a, b = sess.spans[i]
+            for a, b in sess.flags:
                 box.tag_add("flag", idx(a), idx(b))
             if 0 <= sess.cur < len(sess.spans) and not sess.finished:
                 a, b = sess.spans[sess.cur]
@@ -2558,13 +2661,21 @@ class Widget:
             n = len(sess.flags)
             if error:
                 status.config(text=error)
+            elif not started["yes"]:
+                status.config(text=f"Dictation ready ({count_sentences(text)} sentences).  "
+                                   f"ENTER = read it back to me     ESC = paste it now")
+            elif sess.note:
+                status.config(text=sess.note)
             elif sess.finished:
-                status.config(text=f"Finished. {n} flagged. Copy the list or the marked text "
-                                   f"below. (Left = read again from the previous phrase)")
+                status.config(text=f"Finished. {n} flagged.  "
+                                   + ("ESC = paste and close" if review_cb else
+                                      "Copy the list below, or ESC to close.")
+                                   + "  (Left = read again from the previous phrase)")
             else:
                 state = "Paused" if sess.paused else "Reading"
                 status.config(text=f"{state} {sess.cur + 1}/{len(sess.spans)} · {n} flagged · "
-                                   f"SPACE = flag, P = pause, ←/→ = back/skip")
+                                   f"SPACE = flag word, P = pause, ←/→ = back/skip"
+                                   + ("  ·  ESC = paste and close" if review_cb else ""))
 
         def pump():
             err = None
@@ -2584,32 +2695,49 @@ class Widget:
             self.root.clipboard_append(what)
             status.config(text="Copied to the clipboard.")
 
+        def begin():
+            if not started["yes"]:
+                started["yes"] = True
+                sess.start()
+
         def closing():
             sess.stop()
             win.destroy()
+            if review_cb:  # give focus back to the app you were in, then paste
+                self.root.after(300, review_cb)
 
         def key(fn):
             def handler(_e=None):
-                fn()
+                if started["yes"] or fn in (closing, begin):
+                    fn()
                 return "break"
             return handler
 
-        for k, fn in (("<space>", sess.flag), ("<p>", sess.toggle_pause),
-                      ("<Left>", lambda: sess.jump(-1)), ("<Right>", lambda: sess.jump(1)),
-                      ("<Escape>", closing)):
+        keys = [("<space>", sess.flag), ("<p>", sess.toggle_pause),
+                ("<Left>", lambda: sess.jump(-1)), ("<Right>", lambda: sess.jump(1)),
+                ("<Escape>", closing)]
+        if review_cb:
+            keys.append(("<Return>", begin))
+        for k, fn in keys:
             win.bind(k, key(fn))
             box.bind(k, key(fn))
-        for label, fn in (("Pause / resume", sess.toggle_pause),
-                          ("Back", lambda: sess.jump(-1)), ("Skip", lambda: sess.jump(1)),
-                          ("Copy flagged list", lambda: copy(sess.flagged_report())),
-                          ("Copy text with [CHECK] marks", lambda: copy(sess.marked_text())),
-                          ("Close", closing)):
-            tk.Button(bar, text=label, command=fn, takefocus=0).pack(side="left", padx=3)
+        buttons = []
+        if review_cb:
+            buttons.append(("Read it back (Enter)", begin))
+        buttons += [("Pause / resume", sess.toggle_pause),
+                    ("Back", lambda: sess.jump(-1)), ("Skip", lambda: sess.jump(1)),
+                    ("Copy flagged list", lambda: copy(sess.flagged_report())),
+                    ("Copy with [CHECK] marks", lambda: copy(sess.marked_text())),
+                    ("Paste and close (Esc)" if review_cb else "Close (Esc)", closing)]
+        for label, fn in buttons:
+            tk.Button(bar, text=label, command=fn,
+                      takefocus=0).pack(side="left", padx=3)
         win.protocol("WM_DELETE_WINDOW", closing)
         win.lift()
         win.focus_force()
         box.focus_set()
-        sess.start()
+        if started["yes"]:
+            sess.start()
         pump()
 
     def _show_text(self, title: str, body: str, path, markdown: bool = False) -> None:
@@ -3167,13 +3295,25 @@ class App:
                 self.ui("nospeech")
                 return
             self.last_text = text
-            insert_text(text, self.cfg["insert_method"], self.notify)
+            if (self.cfg["review_long_dictation"] and self.widget
+                    and count_sentences(text) >= int(self.cfg["review_min_sentences"])):
+                # long: show it first (Enter = read back, Esc = paste); the window pastes it
+                self.widget.q.put(("proof", text, lambda t=text: self.post(
+                    lambda: self._insert(t))))
+            else:
+                insert_text(text, self.cfg["insert_method"], self.notify)
             self.ui("done")
         except Exception:
             log.exception("dictation failed")
             self.ui("nospeech")
         finally:
             self._set_idle()
+
+    def _insert(self, text: str) -> None:
+        try:
+            insert_text(text, self.cfg["insert_method"], self.notify)
+        except Exception:
+            log.exception("insert failed")
 
     def recall(self) -> None:
         if self.last_text and self.mode == "idle":

@@ -216,15 +216,30 @@ Set `wayland_portals = true` in `config.toml` and `pip install jeepney`. Then:
 
 Select text in any app (email draft, dictation result) and press **Ctrl+Alt+P**. A window opens
 and reads it aloud one short phrase at a time, highlighting the phrase being spoken. When
-something sounds wrong press **Space**: that phrase is flagged red (press again to unflag; a
-press within 0.6 s of a phrase starting counts for the previous phrase). **P** pauses,
-**Left/Right** go back/skip. At the end, **Copy flagged list** or **Copy text with [CHECK]
-marks** gives you the places to fix.
-- Needs a voice: `sudo dnf install espeak-ng` (robotic but fine for this).
+something sounds wrong press **Space**: the word you just heard is flagged red (press Space
+again on it to unflag; PyKeet allows `proofread_reaction_seconds` for your reaction time).
+**P** pauses, **Left/Right** go back/skip. At the end, **Copy flagged list** or **Copy with
+[CHECK] marks** gives you the places to fix.
+
+**Long dictations ask first.** When a dictation is 3+ sentences (`review_min_sentences`) it is
+not pasted straight away. A window shows it: **Enter** reads it back to you (and you can flag
+mistakes), **Esc** pastes it and closes. Turn off with `review_long_dictation = false`.
+If GNOME refuses to give that window keyboard focus, click it once.
+
+**Voices** (`tts_engine = "auto"` tries them in this order; models download on first use into
+`tts-models/`):
+1. **Kokoro** - the most natural. `pip install kokoro-onnx`. About 120 MB of models and
+   0.5-1 GB RAM while speaking (tested here: ~400 MB, int8 model, faster than real time).
+   Change voice with `kokoro_voice` (UK: bf_emma, bf_isabella, bm_george, bm_lewis).
+2. **Piper** - lighter, flatter. `pip install piper-tts`. `piper_noise_scale` makes it livelier.
+3. **espeak-ng** - robotic, nothing to download: `sudo dnf install espeak-ng`.
+
+Word-level flags use estimated word timings (the voice doesn't report them), so a flag can land
+a word either side. Piper's download and voices were not tested here; Kokoro was.
 - On Wayland, select the text and press the shortcut; if nothing is picked up, press Ctrl+C
   first (PyKeet falls back to the clipboard).
-- It catches what *sounds* wrong (mis-heard words, garbled names). It cannot catch mistakes that
-  sound identical when spoken, like there/their.
+- It catches what *sounds* wrong (mis-heard words, garbled names), not mistakes that sound
+  identical when spoken, like there/their.
 
 ## Autostart on login
 

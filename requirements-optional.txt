@@ -17,3 +17,6 @@ spacy
 # Optional, Wayland only (config: wayland_portals = true): type text and register global
 # shortcuts through the desktop portals. Pure Python, tiny.
 jeepney
+# Optional, proofreader voices (config: tts_engine). Kokoro is livelier, Piper lighter.
+kokoro-onnx
+# piper-tts

@@ -117,14 +117,34 @@ phrase_min_similarity = 0
 # --- Proofreading (read text aloud, flag what sounds wrong) -------------------
 # Select text anywhere and press proofread_shortcut (on Wayland: select it, or copy it with
 # Ctrl+C first). A window reads it to you one short phrase at a time. Press SPACE when something
-# sounds wrong to flag that phrase. P = pause, Left/Right = back/skip. Uses espeak-ng
-# (sudo dnf install espeak-ng), else speech-dispatcher's spd-say; `say` on macOS.
-proofread_speed = 170            # words per minute
-proofread_voice = ""             # e.g. "en-gb" for espeak-ng; empty = default
+# sounds wrong to flag the word being spoken. P = pause, Left/Right = back/skip.
+# Long dictations are offered for read-back automatically (see review_* below).
+#
+# Voice engine: "auto" = Kokoro, else Piper, else the espeak-ng command. Models download the
+# first time they are used (into the tts-models folder). Optional installs:
+#   pip install kokoro-onnx     (livelier, ~120 MB of models, ~0.5-1 GB RAM while speaking)
+#   pip install piper-tts       (lighter, ~60 MB voice)
+#   sudo dnf install espeak-ng  (robotic, but nothing to download)
+tts_engine = "auto"              # "auto", "kokoro", "piper" or "espeak"
+kokoro_voice = "bf_emma"         # bf_emma bf_isabella bm_george bm_lewis (UK); af_heart am_adam (US)
+kokoro_lang = "en-gb"            # "en-gb" or "en-us"
+kokoro_speed = 1.0               # 0.8 = slower
+kokoro_model = "int8"            # "int8" (92 MB), "fp16" (177 MB), "full" (326 MB, best)
+piper_voice = "en_GB-alan-medium"
+piper_speed = 1.05               # > 1 is slower
+piper_noise_scale = 0.8          # higher = livelier pitch (0.667 is Piper's default; > 1 gets wobbly)
+piper_noise_w = 0.9              # higher = less regular rhythm
+proofread_speed = 170            # espeak only: words per minute
+proofread_voice = ""             # espeak only, e.g. "en-gb"
 proofread_phrase_words = 14      # longest phrase read at once (smaller = more precise flags)
-# You react a moment after you hear a mistake; a flag pressed within this many seconds of a
-# phrase starting goes to the PREVIOUS phrase.
-proofread_reaction_seconds = 0.6
+# You react a moment after you hear a mistake, so the flag goes to the word spoken this many
+# seconds before you pressed Space.
+proofread_reaction_seconds = 0.5
+
+# When a dictation is this many sentences or longer, show it in a window first instead of
+# pasting straight away:  Enter = read it back to me (and flag mistakes),  Esc = paste it now.
+review_long_dictation = true
+review_min_sentences = 3
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
