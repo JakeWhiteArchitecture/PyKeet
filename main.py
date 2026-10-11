@@ -34,7 +34,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.4"
+VERSION = "1.5"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -63,12 +63,23 @@ cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
 import_shortcut = "ctrl+alt+o"
+# Read the selected (or copied) text aloud in a proofreading window - see "Proofreading" below
+proofread_shortcut = "ctrl+alt+p"
 
 # On Wayland (Fedora 43 GNOME) apps cannot listen for keys globally. Run
 #   python main.py --install-gnome-shortcuts
 # once and GNOME itself will run PyKeet's shortcuts (toggle only: press to start, press to stop).
 # true = also try the old key listener on Wayland (only works for XWayland windows; usually useless).
 use_pynput_on_wayland = false
+# true = on Wayland use the desktop "portals" instead (needs `pip install jeepney`):
+#   - types dictated text for you (GNOME asks permission once, at startup), and
+#   - registers the global shortcuts itself with press AND release (GNOME 48+; GNOME shows a
+#     dialog to confirm them). Do not also run --install-gnome-shortcuts, or each fires twice.
+# Falls back to the copy-and-notify behaviour for whatever the desktop refuses.
+wayland_portals = false
+# On Wayland the floating pill may not show or stay on top, so also show small notifications
+# for recording / transcribing / done.
+wayland_status_notifications = true
 
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
@@ -159,6 +170,18 @@ action_server = "http://127.0.0.1:8080"
 # (0 = automatic: 0.35 for "phrases", 0.55 for "needle-phrases"). Raise it for fewer false hits.
 phrase_min_similarity = 0
 
+# --- Proofreading (read text aloud, flag what sounds wrong) -------------------
+# Select text anywhere and press proofread_shortcut (on Wayland: select it, or copy it with
+# Ctrl+C first). A window reads it to you one short phrase at a time. Press SPACE when something
+# sounds wrong to flag that phrase. P = pause, Left/Right = back/skip. Uses espeak-ng
+# (sudo dnf install espeak-ng), else speech-dispatcher's spd-say; `say` on macOS.
+proofread_speed = 170            # words per minute
+proofread_voice = ""             # e.g. "en-gb" for espeak-ng; empty = default
+proofread_phrase_words = 14      # longest phrase read at once (smaller = more precise flags)
+# You react a moment after you hear a mistake; a flag pressed within this many seconds of a
+# phrase starting goes to the PREVIOUS phrase.
+proofread_reaction_seconds = 0.6
+
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
 widget_position = []
@@ -178,6 +201,13 @@ DEFAULTS = {
     "cancel_shortcut": "esc",
     "call_shortcut": "ctrl+alt+r",
     "import_shortcut": "ctrl+alt+o",
+    "proofread_shortcut": "ctrl+alt+p",
+    "proofread_speed": 170,
+    "proofread_voice": "",
+    "proofread_phrase_words": 14,
+    "proofread_reaction_seconds": 0.6,
+    "wayland_portals": False,
+    "wayland_status_notifications": True,
     "native_file_picker": True,
     "call_workers": 2,
     "trim_dictation_silence": True,
@@ -1660,6 +1690,9 @@ def native_picker_command() -> list[str] | None:
     return None
 
 
+PORTAL = None  # portal.Portal once Wayland portals are connected
+
+
 def is_wayland() -> bool:
     return sys.platform.startswith("linux") and (
         os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
@@ -1677,6 +1710,12 @@ def insert_text(text: str, method: str, notify=None) -> None:
     import pyperclip
 
     wayland = is_wayland()
+    if wayland and method != "clipboard" and PORTAL is not None and PORTAL.rd_session:
+        try:
+            PORTAL.type_text(text)
+            return
+        except Exception:
+            log.exception("portal typing failed; falling back")
     if wayland and method != "clipboard" and not ydotool_ready():
         log.warning("Wayland: cannot press keys (ydotool not set up); text copied instead")
         method = "clipboard"
@@ -1747,6 +1786,7 @@ REMOTE_COMMANDS = {
     "import": "request_file_picker",
     "recall": "recall",
     "cancel-dictation": "cancel_dictation",
+    "proofread": "proofread_selection",
 }
 
 
@@ -1830,7 +1870,15 @@ SHORTCUT_COMMANDS = {
     "call_shortcut": ("toggle-call", "PyKeet call recording"),
     "import_shortcut": ("import", "PyKeet import audio file"),
     "recall_shortcut": ("recall", "PyKeet paste last dictation"),
+    "proofread_shortcut": ("proofread", "PyKeet proofread selection"),
 }
+
+
+def portal_trigger(spec: str) -> str:
+    """'ctrl+alt+r' -> 'CTRL+ALT+r' (XDG GlobalShortcuts trigger format)."""
+    mods, main = parse_shortcut(spec)
+    names = {"ctrl": "CTRL", "alt": "ALT", "shift": "SHIFT", "cmd": "LOGO"}
+    return "+".join([names[m] for m in ("ctrl", "alt", "shift", "cmd") if m in mods] + [main])
 
 
 def gnome_binding(spec: str) -> str:
@@ -1932,6 +1980,7 @@ class Hotkeys:
         self.cancel = parse_shortcut(cfg["cancel_shortcut"])
         self.call = parse_shortcut(cfg["call_shortcut"])
         self.importer = parse_shortcut(cfg["import_shortcut"])
+        self.proofread = parse_shortcut(cfg["proofread_shortcut"])
         self.down: set[str] = set()
         self.last_press: dict[str, float] = {}
         self.ptt_active = False
@@ -1965,6 +2014,10 @@ class Hotkeys:
         mods, main = self.importer
         if name == main and mods <= others:
             self.app.post(self.app.request_file_picker)
+            return
+        mods, main = self.proofread
+        if name == main and mods <= others:
+            self.app.post(self.app.proofread_selection)
             return
         mods, main = self.recall
         if name == main and mods <= others:
@@ -2066,6 +2119,223 @@ class Hotkeys:
     def stop(self) -> None:
         if self.listener:
             self.listener.stop()
+
+
+# --------------------------------------------------------------------------
+# Proofreading: read text aloud phrase by phrase, flag phrases that sound wrong
+# --------------------------------------------------------------------------
+
+def split_phrases(text: str, max_words: int = 14) -> list[tuple[int, int]]:
+    """(start, end) character offsets of readable phrases: sentences, with long ones cut at
+    commas/semicolons/dashes (and, failing that, every max_words words)."""
+    out: list[tuple[int, int]] = []
+    for m in re.finditer(r"[^\n]+", text):
+        line, base = m.group(0), m.start()
+        for sm in re.finditer(r".+?(?:[.!?]+[\"')\]]*(?=\s|$)|$)", line):
+            sent, sb = sm.group(0), base + sm.start()
+            if not sent.strip():
+                continue
+            pieces, last = [], 0
+            for cm in re.finditer(r"[,;:\u2014]\s+|\s[-\u2013]\s", sent):
+                pieces.append((last, cm.end()))
+                last = cm.end()
+            pieces.append((last, len(sent)))
+            cur_s, words = None, 0
+            for a, b in pieces:  # glue tiny pieces together, split huge ones
+                n = len(sent[a:b].split())
+                if cur_s is None:
+                    cur_s, words = a, 0
+                words += n
+                if words >= max_words // 2 or b == len(sent):
+                    chunk = sent[cur_s:b]
+                    toks = list(re.finditer(r"\S+", chunk))
+                    for i in range(0, len(toks), max_words):
+                        grp = toks[i:i + max_words]
+                        out.append((sb + cur_s + grp[0].start(), sb + cur_s + grp[-1].end()))
+                    cur_s = None
+    return out
+
+
+def tts_command(text: str, speed: int, voice: str):
+    """(argv, stdin_text, env) to speak text with whatever speech tool exists, or None."""
+    if sys.platform == "darwin" and shutil.which("say"):
+        argv = ["say", "-r", str(speed)] + (["-v", voice] if voice else [])
+        return argv, text, None
+    if sys.platform.startswith("win"):
+        ps = ("Add-Type -AssemblyName System.Speech;$s=New-Object System.Speech.Synthesis."
+              "SpeechSynthesizer;$s.Rate=%d;$s.Speak($env:PYKEET_SAY)"
+              % max(-10, min(10, (speed - 170) // 15)))
+        return (["powershell", "-NoProfile", "-Command", ps], None,
+                {**os.environ, "PYKEET_SAY": text})
+    for exe in ("espeak-ng", "espeak"):
+        if shutil.which(exe):
+            return ([exe, "--stdin", "-s", str(speed)] + (["-v", voice] if voice else []),
+                    text, None)
+    if shutil.which("spd-say"):
+        rate = max(-100, min(100, (speed - 170) // 2))
+        return ["spd-say", "-w", "-r", str(rate), "--", text], None, None
+    return None
+
+
+def selected_text() -> str:
+    """The text the user has selected, else what is on the clipboard."""
+    def run(argv):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=3)
+            return r.stdout if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    if sys.platform.startswith("linux"):
+        if is_wayland() and shutil.which("wl-paste"):
+            t = run(["wl-paste", "--primary", "--no-newline"]) or run(["wl-paste", "--no-newline"])
+            if t.strip():
+                return t
+        for argv in (["xclip", "-o", "-selection", "primary"], ["xsel", "-o", "-p"]):
+            if shutil.which(argv[0]):
+                t = run(argv)
+                if t.strip():
+                    return t
+    else:  # Windows / macOS: copy the selection, read the clipboard, put the old one back
+        import pyperclip
+        from pynput.keyboard import Controller, Key
+
+        try:
+            old = pyperclip.paste()
+        except Exception:
+            old = ""
+        kb = Controller()
+        mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
+        time.sleep(0.25)  # let the shortcut keys come up
+        with kb.pressed(mod):
+            kb.press("c")
+            kb.release("c")
+        time.sleep(0.2)
+        t = pyperclip.paste()
+        pyperclip.copy(old)
+        if t.strip():
+            return t
+    try:
+        import pyperclip
+
+        return pyperclip.paste() or ""
+    except Exception:
+        return ""
+
+
+class ProofSession:
+    """Reads phrases one after another and records which ones the user flagged.
+    No GUI in here: on_change() is called whenever the position or flags change."""
+
+    def __init__(self, text: str, speak, on_change, max_words: int = 14,
+                 reaction_s: float = 0.6):
+        self.text = text
+        self.spans = split_phrases(text, max_words)
+        self.speak = speak          # speak(phrase_text, session) blocks until spoken/killed
+        self.on_change = on_change
+        self.reaction_s = reaction_s
+        self.cur = -1
+        self.next = 0
+        self.flags: set[int] = set()
+        self.paused = False
+        self.finished = False
+        self.proc = None
+        self.thread = threading.Thread()
+        self._started_at = 0.0
+        self._stop = False
+        self._go = threading.Event()
+        self._go.set()
+        self._lock = threading.Lock()
+
+    def phrase(self, i: int) -> str:
+        a, b = self.spans[i]
+        return self.text[a:b]
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self._stop:
+            self._go.wait()
+            if self._stop:
+                break
+            with self._lock:
+                i = self.next
+                if i >= len(self.spans):
+                    break
+                self.cur, self.next = i, i + 1
+                self._started_at = time.monotonic()
+            self.on_change()
+            try:
+                self.speak(self.phrase(i), self)
+            except Exception:
+                log.exception("speech failed")
+                self.stop()
+                self.on_change(error="Could not speak. Install espeak-ng "
+                                     "(sudo dnf install espeak-ng).")
+                return
+        self.finished = not self._stop
+        self.on_change()
+
+    def _kill(self) -> None:
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+    def flag(self) -> None:
+        """Flag what is being read - or the phrase before it if the press is so soon after a
+        phrase started that you were clearly reacting to the previous one."""
+        with self._lock:
+            i = self.cur
+            if i < 0:
+                return
+            if time.monotonic() - self._started_at < self.reaction_s and i > 0:
+                i -= 1
+            self.flags.symmetric_difference_update({i})
+        self.on_change()
+
+    def toggle_pause(self) -> None:
+        with self._lock:
+            self.paused = not self.paused
+            if self.paused:
+                self._go.clear()
+                self.next = max(self.cur, 0)  # replay the phrase on resume
+            else:
+                self._go.set()
+        if self.paused:
+            self._kill()
+        self.on_change()
+
+    def jump(self, delta: int) -> None:
+        with self._lock:
+            self.next = max(0, min(len(self.spans), self.cur + delta))
+            self.finished = False
+        self._kill()
+        if not self.thread.is_alive() and not self._stop:
+            self.start()  # had finished: read again from here
+
+    def stop(self) -> None:
+        self._stop = True
+        self._go.set()
+        self._kill()
+
+    def flagged_report(self) -> str:
+        if not self.flags:
+            return "Nothing flagged."
+        return "\n".join(f"- {self.phrase(i)}" for i in sorted(self.flags))
+
+    def marked_text(self, marker: str = "[CHECK] ") -> str:
+        out, last = [], 0
+        for i in sorted(self.flags):
+            a, b = self.spans[i]
+            out += [self.text[last:a], marker]
+            last = a
+        out.append(self.text[last:])
+        return "".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -2176,6 +2446,8 @@ class Widget:
                 item = self.q.get_nowait()
                 if isinstance(item, tuple) and item[0] == "text":
                     self._show_text(*item[1:])  # (title, body, path, markdown)
+                elif isinstance(item, tuple) and item[0] == "proof":
+                    self._show_proof(item[1])
                 elif isinstance(item, tuple) and item[0] == "bg":
                     self.bgs = item[1]
                     self._apply()
@@ -2220,6 +2492,125 @@ class Widget:
         self.root.lift()
         self._draw()
         self.root.update_idletasks()
+
+    def _show_proof(self, text: str) -> None:
+        """Proofreading window: reads the text aloud phrase by phrase; SPACE flags a phrase."""
+        tk = self.tk
+        cfg = self.app.cfg
+        win = tk.Toplevel(self.root)
+        win.title("PyKeet proofreading")
+        win.geometry("760x560")
+        font = ("Segoe UI" if sys.platform.startswith("win") else "Helvetica", 13)
+        status = tk.Label(win, anchor="w", text="Starting…")
+        status.pack(side="top", fill="x", padx=8, pady=(8, 0))
+        bar = tk.Frame(win)
+        bar.pack(side="bottom", fill="x", padx=8, pady=6)
+        frame = tk.Frame(win)
+        frame.pack(side="top", fill="both", expand=True, padx=8, pady=6)
+        box = tk.Text(frame, wrap="word", font=font, padx=10, pady=8, spacing3=6)
+        sb = tk.Scrollbar(frame, command=box.yview)
+        box.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+        box.insert("1.0", text)
+        box.tag_configure("now", background="#fff3a8")
+        box.tag_configure("flag", background="#ffb3b3", underline=True)
+        box.tag_raise("now")
+        box.configure(state="disabled")
+
+        events: queue.Queue = queue.Queue()
+
+        def speak(phrase, sess):
+            cmd = tts_command(phrase, int(cfg["proofread_speed"]), str(cfg["proofread_voice"]))
+            if not cmd:
+                raise RuntimeError("no text-to-speech program found")
+            argv, stdin_text, env = cmd
+            sess.proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE if stdin_text is not None else None,
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if stdin_text is not None:
+                try:
+                    sess.proc.communicate(stdin_text.encode("utf-8"))
+                except OSError:
+                    pass
+            sess.proc.wait()
+
+        sess = ProofSession(text, speak, lambda **kw: events.put(kw),
+                            int(cfg["proofread_phrase_words"]),
+                            float(cfg["proofread_reaction_seconds"]))
+        if not sess.spans:
+            win.destroy()
+            return
+
+        def idx(pos):
+            return f"1.0+{pos}c"
+
+        def refresh(error=None):
+            box.tag_remove("now", "1.0", "end")
+            box.tag_remove("flag", "1.0", "end")
+            for i in sess.flags:
+                a, b = sess.spans[i]
+                box.tag_add("flag", idx(a), idx(b))
+            if 0 <= sess.cur < len(sess.spans) and not sess.finished:
+                a, b = sess.spans[sess.cur]
+                box.tag_add("now", idx(a), idx(b))
+                box.see(idx(a))
+            n = len(sess.flags)
+            if error:
+                status.config(text=error)
+            elif sess.finished:
+                status.config(text=f"Finished. {n} flagged. Copy the list or the marked text "
+                                   f"below. (Left = read again from the previous phrase)")
+            else:
+                state = "Paused" if sess.paused else "Reading"
+                status.config(text=f"{state} {sess.cur + 1}/{len(sess.spans)} · {n} flagged · "
+                                   f"SPACE = flag, P = pause, ←/→ = back/skip")
+
+        def pump():
+            err = None
+            try:
+                while True:
+                    err = events.get_nowait().get("error") or err
+            except queue.Empty:
+                pass
+            try:
+                refresh(err)
+            except tk.TclError:
+                return
+            win.after(120, pump)
+
+        def copy(what):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(what)
+            status.config(text="Copied to the clipboard.")
+
+        def closing():
+            sess.stop()
+            win.destroy()
+
+        def key(fn):
+            def handler(_e=None):
+                fn()
+                return "break"
+            return handler
+
+        for k, fn in (("<space>", sess.flag), ("<p>", sess.toggle_pause),
+                      ("<Left>", lambda: sess.jump(-1)), ("<Right>", lambda: sess.jump(1)),
+                      ("<Escape>", closing)):
+            win.bind(k, key(fn))
+            box.bind(k, key(fn))
+        for label, fn in (("Pause / resume", sess.toggle_pause),
+                          ("Back", lambda: sess.jump(-1)), ("Skip", lambda: sess.jump(1)),
+                          ("Copy flagged list", lambda: copy(sess.flagged_report())),
+                          ("Copy text with [CHECK] marks", lambda: copy(sess.marked_text())),
+                          ("Close", closing)):
+            tk.Button(bar, text=label, command=fn, takefocus=0).pack(side="left", padx=3)
+        win.protocol("WM_DELETE_WINDOW", closing)
+        win.lift()
+        win.focus_force()
+        box.focus_set()
+        sess.start()
+        pump()
 
     def _show_text(self, title: str, body: str, path, markdown: bool = False) -> None:
         """Result window. Markdown mode renders headings/bold/timestamps and colours names,
@@ -2458,6 +2849,8 @@ class App:
         self._save_lock = threading.Lock()
         self.bg_phase: str | None = None
         self.bg_note = ""
+        self.portal = None
+        self._wl_status = is_wayland() and bool(cfg["wayland_status_notifications"])
         self._disp: dict | None = None   # the job the pill shows
         self._diarize_warm = False
         threading.Thread(target=self._action_loop, daemon=True).start()
@@ -2475,6 +2868,8 @@ class App:
                 log.exception("action failed")
 
     def ui(self, state: str) -> None:
+        if self._wl_status:
+            self._status_notify(state)
         if self.widget:
             self.widget.send(state)
         self._refresh_tray()
@@ -2605,6 +3000,92 @@ class App:
                 self.start_dictation()
         else:
             self.start_dictation()
+
+    def proofread_selection(self) -> None:
+        """Read the selected text aloud in a proofreading window."""
+        def work():
+            text = selected_text()
+            if not text.strip():
+                self.notify("PyKeet", "Nothing selected. Select some text (or copy it) first.")
+                return
+            if not tts_command("x", 170, ""):
+                self.notify("PyKeet", "No text-to-speech program found. "
+                                      "Install one: sudo dnf install espeak-ng")
+                return
+            if self.widget:
+                self.widget.q.put(("proof", text))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- Wayland portals ---------------------------------------------------------
+    def start_portals(self) -> None:
+        if is_wayland() and self.cfg["wayland_portals"]:
+            threading.Thread(target=self._portals_worker, daemon=True).start()
+
+    def _portals_worker(self) -> None:
+        global PORTAL
+        try:
+            from portal import Portal
+        except ImportError:
+            log.error("wayland_portals needs jeepney: pip install jeepney")
+            self.notify("PyKeet", "wayland_portals needs: pip install jeepney")
+            return
+        try:
+            p = Portal(state_file=HERE / ".portal-restore-token")
+        except Exception:
+            log.exception("could not connect to the desktop portals")
+            return
+        self.portal = p
+        try:
+            p.start_typing()
+            PORTAL = p
+        except Exception:
+            log.exception("portal typing unavailable")
+            self.notify("PyKeet", "Typing permission not granted - text will be copied instead.")
+        cfg = self.cfg
+        actions = {"dictation": None, "call": self.toggle_call,
+                   "import": self.request_file_picker, "recall": self.recall,
+                   "proofread": self.proofread_selection}
+        wanted = {"dictation": ("PyKeet dictation", cfg["dictation_shortcut"]),
+                  "call": ("PyKeet call recording", cfg["call_shortcut"]),
+                  "import": ("PyKeet import audio file", cfg["import_shortcut"]),
+                  "recall": ("PyKeet paste last dictation", cfg["recall_shortcut"]),
+                  "proofread": ("PyKeet proofread selection", cfg["proofread_shortcut"])}
+
+        def activated(sid):
+            if sid == "dictation":
+                if self.dictation_enabled:
+                    self.post(self.on_dictation_press)
+            elif sid in actions:
+                self.post(actions[sid])
+
+        def deactivated(sid):
+            if sid == "dictation":
+                self.post(self.on_dictation_release)
+
+        try:
+            p.bind_shortcuts({k: (d, portal_trigger(t)) for k, (d, t) in wanted.items()},
+                             activated, deactivated)
+        except Exception:
+            log.exception("portal shortcuts unavailable")
+            self.notify("PyKeet", "Global shortcuts not available. Run: python main.py "
+                                  "--install-gnome-shortcuts")
+
+    _STATUS_TEXT = {"rec": "Recording…", "call": "Recording call…",
+                    "transcribing": "Transcribing…", "done": "Done",
+                    "nospeech": "No speech heard"}
+
+    def _status_notify(self, state: str) -> None:
+        msg = self._STATUS_TEXT.get(state)
+        if not msg or not shutil.which("notify-send"):
+            return
+        try:
+            subprocess.Popen(["notify-send", "-u", "low", "-t", "2500", "-a", "PyKeet",
+                              "--hint=string:x-canonical-private-synchronous:pykeet",
+                              "PyKeet", msg],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
 
     def toggle_dictation(self) -> None:
         """Press-to-start / press-to-stop whatever dictation_mode is (used by remote commands)."""
@@ -3027,6 +3508,8 @@ class App:
             self.hotkeys.stop()
         if getattr(self, "remote", None):
             self.remote.stop()
+        if self.portal:
+            self.portal.close()
         if self.tray:
             self.tray.stop()
         self.engine.close()
@@ -3219,6 +3702,7 @@ def main() -> None:
         app.remote.start()
     except OSError:
         log.exception("could not open the remote control socket")
+    app.start_portals()
     app.start_tray()
     app.load_in_background()
     try:

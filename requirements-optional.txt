@@ -14,3 +14,6 @@ spacy
 # transformers
 # Optional, tiny decision/task detector (config: action_backend = "needle"). ~no dependencies.
 # cactus-needle
+# Optional, Wayland only (config: wayland_portals = true): type text and register global
+# shortcuts through the desktop portals. Pure Python, tiny.
+jeepney

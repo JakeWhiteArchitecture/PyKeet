@@ -7,12 +7,23 @@ cancel_shortcut = "esc"
 call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav) - same as the tray menu item
 import_shortcut = "ctrl+alt+o"
+# Read the selected (or copied) text aloud in a proofreading window - see "Proofreading" below
+proofread_shortcut = "ctrl+alt+p"
 
 # On Wayland (Fedora 43 GNOME) apps cannot listen for keys globally. Run
 #   python main.py --install-gnome-shortcuts
 # once and GNOME itself will run PyKeet's shortcuts (toggle only: press to start, press to stop).
 # true = also try the old key listener on Wayland (only works for XWayland windows; usually useless).
 use_pynput_on_wayland = false
+# true = on Wayland use the desktop "portals" instead (needs `pip install jeepney`):
+#   - types dictated text for you (GNOME asks permission once, at startup), and
+#   - registers the global shortcuts itself with press AND release (GNOME 48+; GNOME shows a
+#     dialog to confirm them). Do not also run --install-gnome-shortcuts, or each fires twice.
+# Falls back to the copy-and-notify behaviour for whatever the desktop refuses.
+wayland_portals = false
+# On Wayland the floating pill may not show or stay on top, so also show small notifications
+# for recording / transcribing / done.
+wayland_status_notifications = true
 
 # "toggle" = press the shortcut once to start, again to stop and transcribe
 # "push"   = hold the shortcut while talking, release to transcribe
@@ -102,6 +113,18 @@ action_server = "http://127.0.0.1:8080"
 # How alike a sentence must be to a phrase to count for the two "phrases" backends
 # (0 = automatic: 0.35 for "phrases", 0.55 for "needle-phrases"). Raise it for fewer false hits.
 phrase_min_similarity = 0
+
+# --- Proofreading (read text aloud, flag what sounds wrong) -------------------
+# Select text anywhere and press proofread_shortcut (on Wayland: select it, or copy it with
+# Ctrl+C first). A window reads it to you one short phrase at a time. Press SPACE when something
+# sounds wrong to flag that phrase. P = pause, Left/Right = back/skip. Uses espeak-ng
+# (sudo dnf install espeak-ng), else speech-dispatcher's spd-say; `say` on macOS.
+proofread_speed = 170            # words per minute
+proofread_voice = ""             # e.g. "en-gb" for espeak-ng; empty = default
+proofread_phrase_words = 14      # longest phrase read at once (smaller = more precise flags)
+# You react a moment after you hear a mistake; a flag pressed within this many seconds of a
+# phrase starting goes to the PREVIOUS phrase.
+proofread_reaction_seconds = 0.6
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.

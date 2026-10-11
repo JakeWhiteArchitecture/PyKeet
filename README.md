@@ -198,6 +198,34 @@ probably break. Rebuild it:
 `python3.13 -m venv .venv && source .venv/bin/activate`, then the CPU-only torch command and
 `pip install -r requirements.txt` from the Install section.
 
+### Wayland stages 2-4 (all optional, all untested on real GNOME)
+
+Set `wayland_portals = true` in `config.toml` and `pip install jeepney`. Then:
+- **Typing:** at start GNOME asks once to let PyKeet control the keyboard (the answer is
+  remembered). Dictated text is then typed into the focused app, no Ctrl+V needed.
+- **Hold-to-talk:** PyKeet registers the shortcuts itself through the GlobalShortcuts portal
+  (GNOME 48+), which reports key press *and* release, so `dictation_mode = "push"` can work.
+  GNOME shows a dialog to confirm the keys. If you ran `--install-gnome-shortcuts` earlier,
+  remove those custom shortcuts first (Settings > Keyboard) or each key fires twice.
+- **Feedback:** the floating pill runs through XWayland and may not show or stay on top. With
+  `wayland_status_notifications = true` you get small "Recording / Transcribing / Done"
+  notifications instead. GNOME has no tray icon without an extension; use the shortcuts.
+- Anything the desktop refuses falls back to the Stage 1 behaviour, and the reason is in the log.
+
+## Proofreading: have the text read back to you
+
+Select text in any app (email draft, dictation result) and press **Ctrl+Alt+P**. A window opens
+and reads it aloud one short phrase at a time, highlighting the phrase being spoken. When
+something sounds wrong press **Space**: that phrase is flagged red (press again to unflag; a
+press within 0.6 s of a phrase starting counts for the previous phrase). **P** pauses,
+**Left/Right** go back/skip. At the end, **Copy flagged list** or **Copy text with [CHECK]
+marks** gives you the places to fix.
+- Needs a voice: `sudo dnf install espeak-ng` (robotic but fine for this).
+- On Wayland, select the text and press the shortcut; if nothing is picked up, press Ctrl+C
+  first (PyKeet falls back to the clipboard).
+- It catches what *sounds* wrong (mis-heard words, garbled names). It cannot catch mistakes that
+  sound identical when spoken, like there/their.
+
 ## Autostart on login
 
 - **Windows:** `Win+R`, type `shell:startup`, add a shortcut to
