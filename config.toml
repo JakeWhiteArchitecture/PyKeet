@@ -139,7 +139,9 @@ proofread_phrase_words = 14      # longest phrase read at once (smaller = more p
 proofread_reaction_seconds = 0.5
 
 # When a dictation is this many sentences or longer, show it in a window first instead of
-# pasting straight away:  Enter = read it back to me (and flag mistakes),  Esc = paste it now.
+# pasting straight away. It reads the text back to you at once (SPACE flags a word you think
+# is wrong). "Copy plain and close" (or Esc) pastes it; the other button pastes it with
+# [CHECK] marks at your flags. No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
 

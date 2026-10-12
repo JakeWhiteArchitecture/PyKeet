@@ -34,7 +34,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.6"
+VERSION = "1.7"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -195,7 +195,9 @@ proofread_phrase_words = 14      # longest phrase read at once (smaller = more p
 proofread_reaction_seconds = 0.5
 
 # When a dictation is this many sentences or longer, show it in a window first instead of
-# pasting straight away:  Enter = read it back to me (and flag mistakes),  Esc = paste it now.
+# pasting straight away. It reads the text back to you at once (SPACE flags a word you think
+# is wrong). "Copy plain and close" (or Esc) pastes it; the other button pastes it with
+# [CHECK] marks at your flags. No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
 
@@ -2028,6 +2030,9 @@ class Hotkeys:
         others = self.down - {name}
 
         mods, main = self.dictation
+        if name == main and mods <= others and self.app.review_open:
+            self.app.post(self.app.review_reminder)
+            return
         if name == main and mods <= others and not self.app.dictation_enabled:
             log.info("dictation hotkey seen but ignored (ready=%s paused=%s mode=%s)",
                      self.app.ready, self.app.paused, self.app.mode)
@@ -2340,6 +2345,18 @@ class ProofSession:
             self._kill()
         self.on_change()
 
+    def restart(self) -> None:
+        """Back to the start, playing (also resumes if paused)."""
+        with self._lock:
+            self.next = 0
+            self.paused = False
+            self.finished = False
+            self._go.set()
+        self._kill()
+        if not self.thread.is_alive() and not self._stop:
+            self.start()
+        self.on_change()
+
     def jump(self, delta: int) -> None:
         with self._lock:
             self.next = max(0, min(len(self.spans), self.cur + delta))
@@ -2487,7 +2504,12 @@ class Widget:
                 if isinstance(item, tuple) and item[0] == "text":
                     self._show_text(*item[1:])  # (title, body, path, markdown)
                 elif isinstance(item, tuple) and item[0] == "proof":
-                    self._show_proof(*item[1:])  # (text, review_cb or None)
+                    try:
+                        self._show_proof(*item[1:])  # (text, review_cb or None)
+                    except Exception:
+                        log.exception("could not open the read-back window")
+                        if len(item) > 2 and item[2]:
+                            item[2](item[1])  # don't lose the text or leave dictation blocked
                 elif isinstance(item, tuple) and item[0] == "bg":
                     self.bgs = item[1]
                     self._apply()
@@ -2534,13 +2556,14 @@ class Widget:
         self.root.update_idletasks()
 
     def _show_proof(self, text: str, review_cb=None) -> None:
-        """Proofreading window: reads the text aloud phrase by phrase; SPACE flags the word being
-        spoken. With review_cb (a long dictation) it first asks: Enter = read it back,
-        Esc = paste it now; closing the window in any way pastes it via review_cb."""
+        """Read-back window. Starts reading straight away; SPACE flags the word being spoken.
+        Two buttons end it (copy + close in one go): with [CHECK] marks, or plain. For a
+        dictation (review_cb given) the chosen text is handed back to be pasted, and dictation
+        stays blocked until this window is closed."""
         tk = self.tk
         cfg = self.app.cfg
         win = tk.Toplevel(self.root)
-        win.title("PyKeet - dictation ready" if review_cb else "PyKeet proofreading")
+        win.title("PyKeet - read back" if review_cb else "PyKeet proofreading")
         win.geometry("760x560")
         font = ("Segoe UI" if sys.platform.startswith("win") else "Helvetica", 13)
         status = tk.Label(win, anchor="w", text="Starting…", justify="left", wraplength=720)
@@ -2561,7 +2584,7 @@ class Widget:
         box.configure(state="disabled")
 
         events: queue.Queue = queue.Queue()
-        tts_state: dict = {"tried": False, "cache": None}
+        tts_state: dict = {"tried": False, "cache": None, "fails": 0}
 
         def speak(phrase, sess):
             if not tts_state["tried"]:
@@ -2582,22 +2605,30 @@ class Widget:
                     log.exception("embedded speech unavailable")
                     sess.note = ""
             cache = tts_state["cache"]
-            if cache:
-                tts = tts_state["tts"]
-                me = sess.cur
+            if not cache:
+                raise RuntimeError("no voice installed - run: pip install kokoro-onnx")
+            tts = tts_state["tts"]
+            me = sess.cur
+            try:
                 samples, sr = cache.get(phrase)
-                if me + 1 < len(sess.spans):
-                    cache.prefetch(sess.phrase(me + 1))
-                if sess.next != me + 1 or sess._stop:
-                    return  # skipped or paused while this was being prepared
-                pb = tts.Playback(samples, sr)
-                sess.proc = pb
-                sess.set_words(me, tts.word_spans(phrase, sess.spans[me][0], pb.duration))
-                pb.start()
-                sess.began_playing()
-                pb.wait()
-                return
-            raise RuntimeError("no voice installed - run: pip install kokoro-onnx")
+                tts_state["fails"] = 0
+            except Exception:
+                tts_state["fails"] += 1
+                log.exception("proofread: could not speak phrase %d/%d", me + 1, len(sess.spans))
+                if tts_state["fails"] >= 3:
+                    raise RuntimeError("the voice keeps failing (see the log)")
+                return  # skip this phrase, carry on with the next
+            if me + 1 < len(sess.spans):
+                cache.prefetch(sess.phrase(me + 1))
+            if sess.next != me + 1 or sess._stop:
+                return  # skipped or paused while this was being prepared
+            pb = tts.Playback(samples, sr)
+            sess.proc = pb
+            sess.set_words(me, tts.word_spans(phrase, sess.spans[me][0], pb.duration))
+            log.info("proofread: phrase %d/%d (%.1fs)", me + 1, len(sess.spans), pb.duration)
+            pb.start()
+            sess.began_playing()
+            pb.wait()
 
         sess = ProofSession(text, speak, lambda **kw: events.put(kw),
                             int(cfg["proofread_phrase_words"]),
@@ -2605,9 +2636,8 @@ class Widget:
         if not sess.spans:
             win.destroy()
             if review_cb:
-                review_cb()
+                review_cb(text)
             return
-        started = {"yes": not review_cb}
 
         def idx(pos):
             return f"1.0+{pos}c"
@@ -2621,24 +2651,20 @@ class Widget:
                 a, b = sess.spans[sess.cur]
                 box.tag_add("now", idx(a), idx(b))
                 box.see(idx(a))
+            pause_btn.config(text="Resume" if sess.paused else "Pause")
             n = len(sess.flags)
             if error:
                 status.config(text=error)
-            elif not started["yes"]:
-                status.config(text=f"Dictation ready ({count_sentences(text)} sentences).  "
-                                   f"ENTER = read it back to me     ESC = paste it now")
             elif sess.note:
                 status.config(text=sess.note)
             elif sess.finished:
-                status.config(text=f"Finished. {n} flagged.  "
-                                   + ("ESC = paste and close" if review_cb else
-                                      "Copy the list below, or ESC to close.")
-                                   + "  (Left = read again from the previous phrase)")
+                status.config(text=f"Finished reading. {n} flagged. Copy to finish (Esc = copy "
+                                   f"plain and close).")
             else:
                 state = "Paused" if sess.paused else "Reading"
                 status.config(text=f"{state} {sess.cur + 1}/{len(sess.spans)} · {n} flagged · "
-                                   f"SPACE = flag word, P = pause, ←/→ = back/skip"
-                                   + ("  ·  ESC = paste and close" if review_cb else ""))
+                                   f"SPACE = flag the word you just heard · P = pause · Esc = "
+                                   f"copy plain and close")
 
         def pump():
             err = None
@@ -2653,54 +2679,42 @@ class Widget:
                 return
             win.after(120, pump)
 
-        def copy(what):
-            self.root.clipboard_clear()
-            self.root.clipboard_append(what)
-            status.config(text="Copied to the clipboard.")
-
-        def begin():
-            if not started["yes"]:
-                started["yes"] = True
-                sess.start()
-
-        def closing():
+        def finish(marked: bool):
+            """Copy and close in one step. Closing the window by any route lands here."""
+            out = sess.marked_text() if marked else text
             sess.stop()
+            if not review_cb:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(out)
+                self.root.update()  # hand the text to the clipboard before the window goes
             win.destroy()
             if review_cb:  # give focus back to the app you were in, then paste
-                self.root.after(300, review_cb)
+                self.root.after(300, lambda: review_cb(out))
 
         def key(fn):
             def handler(_e=None):
-                if started["yes"] or fn in (closing, begin):
-                    fn()
+                fn()
                 return "break"
             return handler
 
-        keys = [("<space>", sess.flag), ("<p>", sess.toggle_pause),
-                ("<Left>", lambda: sess.jump(-1)), ("<Right>", lambda: sess.jump(1)),
-                ("<Escape>", closing)]
-        if review_cb:
-            keys.append(("<Return>", begin))
-        for k, fn in keys:
+        for k, fn in (("<space>", sess.flag), ("<p>", sess.toggle_pause),
+                      ("<Left>", lambda: sess.jump(-1)), ("<Right>", lambda: sess.jump(1)),
+                      ("<Escape>", lambda: finish(False))):
             win.bind(k, key(fn))
             box.bind(k, key(fn))
-        buttons = []
-        if review_cb:
-            buttons.append(("Read it back (Enter)", begin))
-        buttons += [("Pause / resume", sess.toggle_pause),
-                    ("Back", lambda: sess.jump(-1)), ("Skip", lambda: sess.jump(1)),
-                    ("Copy flagged list", lambda: copy(sess.flagged_report())),
-                    ("Copy with [CHECK] marks", lambda: copy(sess.marked_text())),
-                    ("Paste and close (Esc)" if review_cb else "Close (Esc)", closing)]
-        for label, fn in buttons:
-            tk.Button(bar, text=label, command=fn,
-                      takefocus=0).pack(side="left", padx=3)
-        win.protocol("WM_DELETE_WINDOW", closing)
+        tk.Button(bar, text="Rewind to start", command=sess.restart,
+                  takefocus=0).pack(side="left", padx=3)
+        pause_btn = tk.Button(bar, text="Pause", command=sess.toggle_pause, takefocus=0)
+        pause_btn.pack(side="left", padx=3)
+        tk.Button(bar, text="Copy plain and close", command=lambda: finish(False),
+                  takefocus=0).pack(side="right", padx=3)
+        tk.Button(bar, text="Copy with [CHECK] marks and close", command=lambda: finish(True),
+                  takefocus=0).pack(side="right", padx=3)
+        win.protocol("WM_DELETE_WINDOW", lambda: finish(False))
         win.lift()
         win.focus_force()
         box.focus_set()
-        if started["yes"]:
-            sess.start()
+        sess.start()
         pump()
 
     def _show_text(self, title: str, body: str, path, markdown: bool = False) -> None:
@@ -2940,6 +2954,7 @@ class App:
         self.bg_phase: str | None = None
         self.bg_note = ""
         self.portal = None
+        self.review_open = False   # read-back window showing: no new dictation until it is closed
         self._wl_status = is_wayland() and bool(cfg["wayland_status_notifications"])
         self._disp: dict | None = None   # the job the pill shows
         self._diarize_warm = False
@@ -2969,7 +2984,7 @@ class App:
 
     @property
     def dictation_enabled(self) -> bool:
-        if not self.ready or self.paused or self.mode == "call":
+        if not self.ready or self.paused or self.mode == "call" or self.review_open:
             return False
         return self.cfg["call_workers"] > 0 or not self.bg_busy
 
@@ -3142,7 +3157,9 @@ class App:
 
         def activated(sid):
             if sid == "dictation":
-                if self.dictation_enabled:
+                if self.review_open:
+                    self.post(self.review_reminder)
+                elif self.dictation_enabled:
                     self.post(self.on_dictation_press)
             elif sid in actions:
                 self.post(actions[sid])
@@ -3186,7 +3203,13 @@ class App:
         if self.cfg["dictation_mode"] == "push":
             self.stop_dictation()
 
+    def review_reminder(self) -> None:
+        self.notify("PyKeet", "Finish with the read-back window first: copy and close it.")
+
     def start_dictation(self) -> None:
+        if self.review_open:
+            self.review_reminder()
+            return
         with self.lock:
             if not self.dictation_enabled or self.mode != "idle":
                 return
@@ -3258,8 +3281,9 @@ class App:
             if (self.cfg["review_long_dictation"] and self.widget
                     and count_sentences(text) >= int(self.cfg["review_min_sentences"])):
                 # long: show it first (Enter = read back, Esc = paste); the window pastes it
-                self.widget.q.put(("proof", text, lambda t=text: self.post(
-                    lambda: self._insert(t))))
+                self.review_open = True
+                self.widget.q.put(("proof", text, lambda t: self.post(
+                    lambda: self._finish_review(t))))
             else:
                 insert_text(text, self.cfg["insert_method"], self.notify)
             self.ui("done")
@@ -3268,6 +3292,10 @@ class App:
             self.ui("nospeech")
         finally:
             self._set_idle()
+
+    def _finish_review(self, text: str) -> None:
+        self.review_open = False
+        self._insert(text)
 
     def _insert(self, text: str) -> None:
         try:

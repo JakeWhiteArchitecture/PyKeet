@@ -219,13 +219,14 @@ Select text in any app (email draft, dictation result) and press **Ctrl+Alt+P**.
 and reads it aloud one short phrase at a time, highlighting the phrase being spoken. When
 something sounds wrong press **Space**: the word you just heard is flagged red (press Space
 again on it to unflag; PyKeet allows `proofread_reaction_seconds` for your reaction time).
-**P** pauses, **Left/Right** go back/skip. At the end, **Copy flagged list** or **Copy with
-[CHECK] marks** gives you the places to fix.
+**P** pauses, **Left/Right** go back/skip. Finish with a copy button (it also closes the window).
 
-**Long dictations ask first.** When a dictation is 3+ sentences (`review_min_sentences`) it is
-not pasted straight away. A window shows it: **Enter** reads it back to you (and you can flag
-mistakes), **Esc** pastes it and closes. Turn off with `review_long_dictation = false`.
-If GNOME refuses to give that window keyboard focus, click it once.
+**Long dictations are read back first.** When a dictation is 3+ sentences (`review_min_sentences`)
+it is not pasted straight away. A window opens and starts reading it to you at once; press
+**Space** when a word sounds wrong. Four buttons: **Rewind to start** (and play), **Pause/Resume**,
+**Copy with [CHECK] marks and close** and **Copy plain and close** (Esc does the same as plain).
+Copying also closes the window, and **you can't start another dictation until it is closed**.
+On Wayland, press Ctrl+V afterwards. Turn off with `review_long_dictation = false`.
 
 **Voices** (`tts_engine = "auto"` tries Kokoro then Piper; install at least one; models download on first use into
 `tts-models/`):
