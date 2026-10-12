@@ -81,14 +81,14 @@ class Pill(QtWidgets.QWidget):
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_position)
-        self.resize(272, 46)
+        self.resize(300, 46)
 
     # -- layout: what to show and how big -----------------------------------------
     def layout_for(self, st: str) -> dict:
         t = theme()
         lab = self.ui.label_for(st)
         if st == "rec":
-            return {"w": 272, "h": 46}
+            return {"w": 300, "h": 46}
         if st == "call":
             return {"w": 290, "h": 46}
         if not lab:
@@ -157,8 +157,8 @@ class Pill(QtWidgets.QWidget):
 
         if st == "rec":
             dot(t["pink"])
-            bars(44)
-            label(150, mid, M.fmt_ts(now - self.ui.t0), t["text"])
+            label(44, mid, M.fmt_ts(now - self.ui.t0), t["text"])
+            bars((w - 10 * 9 + 4) / 2)  # waveform centred on the pill
         elif st == "call":
             if int(now * 2) % 2 == 0:
                 dot(t["pink"])
