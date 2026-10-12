@@ -7,3 +7,5 @@ numpy
 sounddevice
 pynput
 pyperclip
+# Window toolkit (Qt 6): the pill, transcript viewer and read-back window
+PySide6-Essentials

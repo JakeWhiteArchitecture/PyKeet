@@ -146,8 +146,12 @@ review_long_dictation = true
 review_min_sentences = 3
 
 # --- Misc ------------------------------------------------------------------
-# [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
+# [x, y] of the floating widget; empty = bottom centre. Updated when you drag it. (Not used on
+# Wayland, where the desktop decides where windows go.)
 widget_position = []
+# false = never show the floating pill (you still get notifications). Useful if, on Wayland,
+# the pill steals the keyboard focus from the app you are dictating into.
+show_pill = true
 debug = false             # true = transcript text is allowed in the log
 
 # Spoken -> written. Case-insensitive, applied in dictation and call mode.

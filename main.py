@@ -22,7 +22,6 @@ import tempfile
 import threading
 import time
 import zlib
-from collections import deque
 from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.8"
+VERSION = "2.0"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -202,8 +201,12 @@ review_long_dictation = true
 review_min_sentences = 3
 
 # --- Misc ------------------------------------------------------------------
-# [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
+# [x, y] of the floating widget; empty = bottom centre. Updated when you drag it. (Not used on
+# Wayland, where the desktop decides where windows go.)
 widget_position = []
+# false = never show the floating pill (you still get notifications). Useful if, on Wayland,
+# the pill steals the keyboard focus from the app you are dictating into.
+show_pill = true
 debug = false             # true = transcript text is allowed in the log
 
 # Spoken -> written. Case-insensitive, applied in dictation and call mode.
@@ -267,6 +270,7 @@ DEFAULTS = {
     "label_speakers": True,
     "expected_speakers": 2,
     "widget_position": [],
+    "show_pill": True,
     "debug": False,
     "replacements": {},
 }
@@ -1211,7 +1215,7 @@ def action_summary(md: str) -> str:
 
 def md_segments(md: str, names=(), companies=(), highlight: bool = True, ner: bool = False,
                 actions: bool = False):
-    """Turn Markdown into [(text, tags)] for a Tk Text widget.
+    """Turn Markdown into [(text, tags)] for the viewer's text box.
 
     Handles # / ## headings, '- ' bullets, **bold**, leading [mm:ss] timestamps, and (for
     transcript lines) entity highlighting. Pure function so it can be tested without a GUI.
@@ -2404,636 +2408,13 @@ THEME = {"bg": "#0b0e2a", "card": "#1a1a2e", "border": "#4a1d96", "text": "#f2f2
          "yellow": "#ffcc00", "purple": "#4a1d96"}
 
 
-def apply_theme(win) -> None:
-    """Restyle a Tk window and everything in it with THEME (call after building it)."""
-    import tkinter as tk
-
-    t = THEME
-    default_bg = win.cget("bg")
-
-    def walk(w):
-        cls = w.winfo_class()
-        try:
-            if cls in ("Frame", "Toplevel"):
-                w.configure(bg=t["bg"])
-            elif cls == "Label":
-                if w.cget("bg") == default_bg:  # leave the colour-coded legend labels alone
-                    muted = str(w.cget("fg")) in ("#777", "#777777")
-                    w.configure(bg=t["bg"], fg=t["muted"] if muted else t["text"])
-            elif cls == "Button":
-                w.configure(bg=t["card"], fg=t["cyan"], activebackground=t["purple"],
-                            activeforeground=t["text"], relief="flat", bd=0, padx=12, pady=5,
-                            highlightthickness=1, highlightbackground=t["border"],
-                            highlightcolor=t["cyan"], cursor="hand2")
-            elif cls == "Text":
-                w.configure(bg=t["card"], fg=t["text"], insertbackground=t["cyan"],
-                            selectbackground=t["purple"], selectforeground=t["text"],
-                            highlightthickness=1, highlightbackground=t["border"], relief="flat")
-            elif cls == "Scrollbar":
-                w.configure(bg=t["border"], troughcolor=t["card"], activebackground=t["purple"],
-                            relief="flat", bd=0)
-        except tk.TclError:
-            pass
-        for child in w.winfo_children():
-            walk(child)
-
-    win.configure(bg=t["bg"])
-    walk(win)
-
-
-# --------------------------------------------------------------------------
-# Floating widget (tkinter, main thread)
-# --------------------------------------------------------------------------
-
-class Widget:
-    W, H = 272, 46
-    KEY = "#010101"  # transparent colour on Windows
-    X_STATES = ("rec", "transcribing")   # states that show the cancel X
-
-    def __init__(self, app: "App"):
-        import tkinter as tk
-
-        self.app = app
-        self.tk = tk
-        self.q: queue.Queue = queue.Queue()
-        self.root = tk.Tk()
-        self.root.title("PyKeet")
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        try:
-            self.root.attributes("-alpha", 0.9)
-        except tk.TclError:
-            pass
-        bg = THEME["card"]
-        self.canvas = tk.Canvas(self.root, width=self.W, height=self.H,
-                                highlightthickness=0, bg=bg)
-        if sys.platform.startswith("win"):
-            self.canvas.configure(bg=self.KEY)
-            self.root.attributes("-transparentcolor", self.KEY)
-        self.canvas.pack()
-        self.bg = bg
-        self.state = "hidden"   # what is on screen right now
-        self.fg = "hidden"      # dictation / call-recording state (takes priority)
-        self.bgs = "none"       # background job state (call / file transcription)
-        self.t0 = 0.0
-        self.state_since = 0.0
-        self.levels: deque = deque([0.0] * 10, maxlen=10)
-        import tkinter.font as tkfont
-
-        self._font = tkfont.Font(family="Segoe UI" if sys.platform.startswith("win")
-                                 else "Helvetica", size=11, weight="bold")
-        self._moved = False
-        self._place()
-        self.root.withdraw()
-        self._no_focus()
-        self.canvas.bind("<ButtonPress-1>", self._press)
-        self.canvas.bind("<B1-Motion>", self._drag)
-        self.canvas.bind("<ButtonRelease-1>", self._release)
-        self.canvas.bind("<Button-3>", self._right_click)
-        self._drag_origin = None
-        self.root.after(40, self._poll)
-
-    # -- window plumbing -------------------------------------------------------
-    def _place(self) -> None:
-        pos = self.app.cfg.get("widget_position") or []
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        if len(pos) == 2:
-            x, y = int(pos[0]), int(pos[1])
-        else:
-            x, y = (sw - self.W) // 2, sh - self.H - 90
-        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
-
-    def _no_focus(self) -> None:
-        if not sys.platform.startswith("win"):
-            return  # unmanaged (override-redirect) windows do not take focus on X11
-        try:
-            import ctypes
-
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            self.root.update_idletasks()
-            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-            GWL_EXSTYLE, NOACTIVATE, TOOLWINDOW = -20, 0x08000000, 0x00000080
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | NOACTIVATE | TOOLWINDOW)
-        except Exception:
-            log.exception("could not set no-activate window style")
-
-    # -- input -------------------------------------------------------------------
-    def _press(self, e):
-        self._drag_origin = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y())
-        self._moved = False
-
-    def _drag(self, e):
-        if not self._drag_origin:
-            return
-        ox, oy, wx, wy = self._drag_origin
-        dx, dy = e.x_root - ox, e.y_root - oy
-        if abs(dx) + abs(dy) > 4:
-            self._moved = True
-        if self._moved:
-            self.root.geometry(f"+{wx + dx}+{wy + dy}")
-
-    def _x_hit(self, e) -> bool:
-        return self.state in self.X_STATES and e.x > self.W - 34 and e.y < 30
-
-    def _release(self, e):
-        if self._moved:
-            save_widget_position(self.root.winfo_x(), self.root.winfo_y())
-        elif self._x_hit(e):  # the small X, top right: cancel
-            if self.state == "rec":
-                self.app.post(self.app.cancel_dictation)
-            else:
-                self.app.post(self.app.cancel_transcription)
-        elif self.state == "rec":
-            self.app.post(self.app.stop_dictation)
-        self._drag_origin = None
-
-    def _right_click(self, _e):
-        if self.state == "rec":
-            self.app.post(self.app.cancel_dictation)
-
-    # -- state ---------------------------------------------------------------------
-    def send(self, state: str) -> None:
-        """Thread-safe: queue a state change."""
-        self.q.put(state)
-
-    def _poll(self) -> None:
-        try:
-            while True:
-                item = self.q.get_nowait()
-                if isinstance(item, tuple) and item[0] == "text":
-                    self._show_text(*item[1:])  # (title, body, path, markdown)
-                elif isinstance(item, tuple) and item[0] == "proof":
-                    try:
-                        self._show_proof(*item[1:])  # (text, review_cb or None)
-                    except Exception:
-                        log.exception("could not open the read-back window")
-                        if len(item) > 2 and item[2]:
-                            item[2](item[1])  # don't lose the text or leave dictation blocked
-                elif isinstance(item, tuple) and item[0] == "bg":
-                    self.bgs = item[1]
-                    self._apply()
-                else:
-                    self._set(item)
-        except queue.Empty:
-            pass
-        now = time.monotonic()
-        if self.fg == "done" and now - self.state_since > 0.5:
-            self._set("hidden")
-        elif self.fg == "nospeech" and now - self.state_since > 1.0:
-            self._set("hidden")
-        if self.state != "hidden":
-            self._draw()
-        self.root.after(50, self._poll)
-
-    def _set(self, state: str) -> None:
-        if state == "quit":
-            self.root.quit()
-            return
-        if state == "pick_file":
-            self._pick_file()
-            return
-        self.fg = state
-        self.state_since = time.monotonic()
-        if state in ("rec", "call"):
-            self.t0 = time.monotonic()
-        log.info("widget state: %s", state)
-        self._apply()
-
-    def _apply(self) -> None:
-        """Show the dictation/recording state if there is one, else the background job."""
-        eff = self.fg if self.fg != "hidden" else (self.bgs if self.bgs != "none" else "hidden")
-        was_hidden = self.state == "hidden"
-        self.state = eff
-        if eff == "hidden":
-            self.root.withdraw()
-            return
-        if was_hidden:
-            self.root.deiconify()
-        self.root.attributes("-topmost", True)
-        self.root.lift()
-        self._draw()
-        self.root.update_idletasks()
-
-    def _show_proof(self, text: str, review_cb=None) -> None:
-        """Read-back window. Starts reading straight away; SPACE flags the word being spoken.
-        Two buttons end it (copy + close in one go): with [CHECK] marks, or plain. For a
-        dictation (review_cb given) the chosen text is handed back to be pasted, and dictation
-        stays blocked until this window is closed."""
-        tk = self.tk
-        cfg = self.app.cfg
-        win = tk.Toplevel(self.root)
-        win.title("PyKeet - read back" if review_cb else "PyKeet proofreading")
-        win.geometry("760x560")
-        font = ("Segoe UI" if sys.platform.startswith("win") else "Helvetica", 13)
-        status = tk.Label(win, anchor="w", text="Starting…", justify="left", wraplength=720)
-        status.pack(side="top", fill="x", padx=8, pady=(8, 0))
-        bar = tk.Frame(win)
-        bar.pack(side="bottom", fill="x", padx=8, pady=6)
-        frame = tk.Frame(win)
-        frame.pack(side="top", fill="both", expand=True, padx=8, pady=6)
-        box = tk.Text(frame, wrap="word", font=font, padx=10, pady=8, spacing3=6)
-        sb = tk.Scrollbar(frame, command=box.yview)
-        box.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        box.pack(side="left", fill="both", expand=True)
-        box.insert("1.0", text)
-        box.tag_configure("now", background=THEME["purple"])
-        box.tag_configure("flag", background=THEME["pink"], underline=True)
-        box.tag_raise("flag")
-        box.configure(state="disabled")
-
-        events: queue.Queue = queue.Queue()
-        tts_state: dict = {"tried": False, "cache": None, "fails": 0}
-
-        def speak(phrase, sess):
-            if not tts_state["tried"]:
-                tts_state["tried"] = True
-                try:
-                    import tts
-
-                    def note(msg):
-                        sess.note = msg
-                        sess.on_change()
-
-                    speaker = tts.get_speaker(cfg, HERE / "tts-models", note)
-                    sess.note = ""
-                    if speaker:
-                        tts_state["cache"] = tts.AudioCache(speaker)
-                        tts_state["tts"] = tts
-                except Exception:
-                    log.exception("embedded speech unavailable")
-                    sess.note = ""
-            cache = tts_state["cache"]
-            if not cache:
-                raise RuntimeError("no voice installed - run: pip install kokoro-onnx")
-            tts = tts_state["tts"]
-            me = sess.cur
-            try:
-                samples, sr = cache.get(phrase)
-                tts_state["fails"] = 0
-            except Exception:
-                tts_state["fails"] += 1
-                log.exception("proofread: could not speak phrase %d/%d", me + 1, len(sess.spans))
-                if tts_state["fails"] >= 3:
-                    raise RuntimeError("the voice keeps failing (see the log)")
-                return  # skip this phrase, carry on with the next
-            if me + 1 < len(sess.spans):
-                cache.prefetch(sess.phrase(me + 1))
-            if sess.next != me + 1 or sess._stop:
-                return  # skipped or paused while this was being prepared
-            pb = tts.Playback(samples, sr)
-            sess.proc = pb
-            sess.set_words(me, tts.word_spans(phrase, sess.spans[me][0], pb.duration))
-            log.info("proofread: phrase %d/%d (%.1fs)", me + 1, len(sess.spans), pb.duration)
-            pb.start()
-            sess.began_playing()
-            pb.wait()
-
-        sess = ProofSession(text, speak, lambda **kw: events.put(kw),
-                            int(cfg["proofread_phrase_words"]),
-                            float(cfg["proofread_reaction_seconds"]))
-        if not sess.spans:
-            win.destroy()
-            if review_cb:
-                review_cb(text)
-            return
-
-        def idx(pos):
-            return f"1.0+{pos}c"
-
-        def refresh(error=None):
-            box.tag_remove("now", "1.0", "end")
-            box.tag_remove("flag", "1.0", "end")
-            for a, b in sess.flags:
-                box.tag_add("flag", idx(a), idx(b))
-            if 0 <= sess.cur < len(sess.spans) and not sess.finished:
-                a, b = sess.spans[sess.cur]
-                box.tag_add("now", idx(a), idx(b))
-                box.see(idx(a))
-            pause_btn.config(text="Resume" if sess.paused else "Pause")
-            n = len(sess.flags)
-            if error:
-                status.config(text=error)
-            elif sess.note:
-                status.config(text=sess.note)
-            elif sess.finished:
-                status.config(text=f"Finished reading. {n} flagged. Copy to finish (Esc = copy "
-                                   f"plain and close).")
-            else:
-                state = "Paused" if sess.paused else "Reading"
-                status.config(text=f"{state} {sess.cur + 1}/{len(sess.spans)} · {n} flagged · "
-                                   f"SPACE = flag the word you just heard · P = pause · Esc = "
-                                   f"copy plain and close")
-
-        def pump():
-            err = None
-            try:
-                while True:
-                    err = events.get_nowait().get("error") or err
-            except queue.Empty:
-                pass
-            try:
-                refresh(err)
-            except tk.TclError:
-                return
-            win.after(120, pump)
-
-        def finish(marked: bool):
-            """Copy and close in one step. Closing the window by any route lands here."""
-            out = sess.marked_text() if marked else text
-            sess.stop()
-            if not review_cb:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(out)
-                self.root.update()  # hand the text to the clipboard before the window goes
-            win.destroy()
-            if review_cb:  # give focus back to the app you were in, then paste
-                self.root.after(300, lambda: review_cb(out))
-
-        def key(fn):
-            def handler(_e=None):
-                fn()
-                return "break"
-            return handler
-
-        for k, fn in (("<space>", sess.flag), ("<p>", sess.toggle_pause),
-                      ("<Left>", lambda: sess.jump(-1)), ("<Right>", lambda: sess.jump(1)),
-                      ("<Escape>", lambda: finish(False))):
-            win.bind(k, key(fn))
-            box.bind(k, key(fn))
-        tk.Button(bar, text="Rewind to start", command=sess.restart,
-                  takefocus=0).pack(side="left", padx=3)
-        pause_btn = tk.Button(bar, text="Pause", command=sess.toggle_pause, takefocus=0)
-        pause_btn.pack(side="left", padx=3)
-        tk.Button(bar, text="Copy plain and close", command=lambda: finish(False),
-                  takefocus=0).pack(side="right", padx=3)
-        tk.Button(bar, text="Copy with [CHECK] marks and close", command=lambda: finish(True),
-                  takefocus=0).pack(side="right", padx=3)
-        win.protocol("WM_DELETE_WINDOW", lambda: finish(False))
-        apply_theme(win)
-        win.lift()
-        win.focus_force()
-        box.focus_set()
-        sess.start()
-        pump()
-
-    def _show_text(self, title: str, body: str, path, markdown: bool = False) -> None:
-        """Result window. Markdown mode renders headings/bold/timestamps and colours names,
-        phone numbers, addresses, companies and emails; Copy all copies the raw Markdown."""
-        tk = self.tk
-        win = tk.Toplevel(self.root)
-        win.title(title)
-        win.geometry("820x620")
-        win_font = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
-        bar = tk.Frame(win)
-        bar.pack(side="bottom", fill="x", padx=8, pady=6)
-        if markdown:  # colour legend
-            legend = tk.Frame(win)
-            legend.pack(side="bottom", fill="x", padx=8)
-            tk.Label(legend, text="Highlights (best guess):").pack(side="left")
-            for kind, colour in ENTITY_COLOURS.items():
-                tk.Label(legend, text=ENTITY_LABELS[kind], bg=colour, fg="#111",
-                         padx=6).pack(side="left", padx=3)
-            if self.app.cfg.get("highlight_actions"):
-                legend2 = tk.Frame(win)
-                legend2.pack(side="bottom", fill="x", padx=8, pady=(2, 0))
-                tk.Label(legend2, text="Underlined:").pack(side="left")
-                for kind, colour in ACTION_COLOURS.items():
-                    tk.Label(legend2, text=ACTION_LABELS[kind], fg=colour, padx=6,
-                             font=(win_font, 10, "underline")).pack(side="left", padx=3)
-        frame = tk.Frame(win)
-        frame.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 4))
-        text = tk.Text(frame, wrap="word", font=(win_font, 11), padx=10, pady=8, spacing3=4,
-                       undo=False)
-        scroll = tk.Scrollbar(frame, command=text.yview)
-        text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        text.pack(side="left", fill="both", expand=True)
-        text.tag_configure("h1", font=(win_font, 17, "bold"), spacing1=4, spacing3=8)
-        text.tag_configure("h2", font=(win_font, 13, "bold"), spacing1=8)
-        text.tag_configure("bold", font=(win_font, 11, "bold"))
-        text.tag_configure("ts", foreground="#777777", font=("TkFixedFont", 10))
-        text.tag_configure("bullet", foreground="#555555")
-        for kind, colour in ENTITY_COLOURS.items():
-            text.tag_configure(kind, background=colour, foreground="#111111")
-        for kind, colour in ACTION_COLOURS.items():
-            text.tag_configure(kind, underline=True, underlinefg=colour)
-        text.tag_raise("sel")
-        showing = {"mode": "raw" if not markdown else "formatted"}
-
-        def render():
-            text.configure(state="normal")
-            text.delete("1.0", "end")
-            cfg = self.app.cfg
-            if showing["mode"] == "raw":
-                text.insert("1.0", body)
-            elif showing["mode"] == "summary":
-                for chunk, tags in md_segments(action_summary(body), highlight=False):
-                    text.insert("end", chunk, tags)
-            else:
-                for chunk, tags in md_segments(body, cfg.get("highlight_names") or (),
-                                               cfg.get("highlight_companies") or (),
-                                               ner=bool(cfg.get("use_ner")),
-                                               actions=bool(cfg.get("highlight_actions"))):
-                    text.insert("end", chunk, tags)
-            text.configure(state="disabled")  # read-only, but selecting/copying still works
-
-        def copy():
-            win.clipboard_clear()
-            win.clipboard_append(action_summary(body) if showing["mode"] == "summary" else body)
-
-        def set_mode(mode):
-            showing["mode"] = "formatted" if showing["mode"] == mode else mode
-            raw_btn.configure(text="Show formatted" if showing["mode"] == "raw"
-                              else "Show raw Markdown")
-            sum_btn.configure(text="Show formatted" if showing["mode"] == "summary"
-                              else "Action summary")
-            render()
-
-        render()
-        status = tk.Label(win, text="", fg="#777", anchor="w")
-        model_name = str(self.app.cfg.get("action_model") or "")
-        backend = str(self.app.cfg.get("action_backend") or "zeroshot")
-        if (markdown and self.app.cfg.get("highlight_actions")
-                and (model_name or backend in ("server", "needle", "phrases", "needle-phrases"))):
-            status.pack(side="bottom", fill="x", padx=10)
-            status.configure(text="Analysing decisions and tasks with the AI model "
-                                  "(the first time it downloads the model)…")
-            results: queue.Queue = queue.Queue()
-
-            def work():
-                try:
-                    model = get_action_model(model_name, backend,
-                                             str(self.app.cfg.get("action_server") or ""),
-                                             float(self.app.cfg.get("phrase_min_similarity") or 0))
-                    if model is None:
-                        raise RuntimeError("model could not be loaded; see pykeet.log")
-                    analyse_actions(body, model)
-                    results.put(None)
-                except Exception as exc:
-                    log.exception("action analysis failed")
-                    results.put(exc)
-
-            def poll():
-                if not win.winfo_exists():
-                    return
-                try:
-                    res = results.get_nowait()
-                except queue.Empty:
-                    win.after(300, poll)
-                    return
-                if res is None:
-                    status.configure(text="AI analysis done.")
-                    render()
-                else:
-                    status.configure(text=f"AI model unavailable ({res}); showing the phrase rules.")
-
-            threading.Thread(target=work, daemon=True).start()
-            win.after(300, poll)
-        tk.Button(bar, text="Copy all", command=copy).pack(side="left")
-        raw_btn = tk.Button(bar, text="Show raw Markdown", command=lambda: set_mode("raw"))
-        sum_btn = tk.Button(bar, text="Action summary", command=lambda: set_mode("summary"))
-        if markdown:
-            raw_btn.pack(side="left", padx=6)
-            sum_btn.pack(side="left", padx=0)
-        if path:
-            tk.Button(bar, text="Open file", command=lambda: open_path(path)).pack(
-                side="left", padx=6)
-            tk.Label(bar, text=str(path), anchor="w", fg="#777").pack(side="left", padx=6)
-        tk.Button(bar, text="Close", command=win.destroy).pack(side="right")
-        apply_theme(win)
-        text.tag_configure("bullet", foreground=THEME["muted"])
-        text.tag_configure("ts", foreground=THEME["muted"])
-        win.lift()
-        win.focus_force()
-
-    def _pick_file(self) -> None:
-        from tkinter import filedialog
-
-        paths = filedialog.askopenfilenames(title="Choose audio files to transcribe",
-                                            filetypes=AUDIO_TYPES)
-        if paths:
-            self.app.post(lambda: self.app.import_files(paths))
-
-    def _pill_shape(self, x0, y0, x1, y1, fill) -> None:
-        c, h = self.canvas, y1 - y0
-        c.create_oval(x0, y0, x0 + h, y1, fill=fill, outline=fill)
-        c.create_oval(x1 - h, y0, x1, y1, fill=fill, outline=fill)
-        c.create_rectangle(x0 + h / 2, y0, x1 - h / 2, y1, fill=fill, outline=fill)
-
-    def _pill(self, fill: str) -> None:
-        self._pill_shape(0, 0, self.W, self.H, THEME["border"])      # purple outline
-        self._pill_shape(2, 2, self.W - 2, self.H - 2, fill)
-
-    def _bars(self, x0: int) -> None:
-        self.levels.append(min(1.0, (self.app.recorder.level * 9) ** 0.6))
-        for i, lv in enumerate(self.levels):
-            bh = 4 + lv * 26
-            x = x0 + i * 9
-            self.canvas.create_rectangle(x, self.H / 2 - bh / 2, x + 5, self.H / 2 + bh / 2,
-                                         fill=THEME["cyan"], outline="")
-
-    def _label(self, st: str):
-        """(text, colour, show_progress) for the states that are a dot plus one line of text."""
-        t = THEME
-        bg_note = self.app.bg_note
-        if st == "transcribing":
-            return "Transcribing…", t["text"], False
-        if st == "call_preparing":
-            return "Preparing…" + bg_note, t["text"], False
-        if st == "call_queued":
-            return "Waiting for a free worker…" + bg_note, t["muted"], False
-        if st in ("call_transcribing", "call_labelling"):
-            p = self.app.progress()
-            pct = f" ~{int(p * 100)}%" if p is not None else ""
-            return (("Transcribing" if st == "call_transcribing" else "Labelling speakers")
-                    + bg_note + pct), t["text"], p is not None
-        if st == "done":
-            return "Done", t["green"], False
-        if st == "nospeech":
-            return "No speech", t["muted"], False
-        return None
-
-    def _fit(self, st: str) -> None:
-        """Size the pill to what it shows, so no text is cut off."""
-        lab = self._label(st)
-        if st == "rec":
-            w = 272
-        elif st == "call":
-            w = 290
-        elif lab:
-            extra = 36 if st in self.X_STATES else 18
-            w = max(170, 44 + self._font.measure(lab[0]) + extra)
-            if lab[2]:
-                w = max(w, 240)  # room for the progress bar
-        else:
-            return
-        w = min(w, 520)
-        if w != self.W:
-            self.W = w
-            self.canvas.configure(width=w)
-            self.root.geometry(f"{w}x{self.H}")
-
-    def _draw(self) -> None:
-        t = THEME
-        st = self.state
-        self._fit(st)
-        c = self.canvas
-        c.delete("all")
-        self._pill(self.bg)
-        now = time.monotonic()
-        font = ("Segoe UI", 11, "bold") if sys.platform.startswith("win") else ("Helvetica", 11, "bold")
-        mid = self.H / 2
-
-        def dot(color):
-            c.create_oval(18, mid - 7, 32, mid + 7, fill=color, outline=color)
-
-        def text(x, s, color=t["text"]):
-            c.create_text(x, mid, text=s, fill=color, font=font, anchor="w")
-
-        if st == "rec":
-            dot(t["pink"])
-            self._bars(44)
-            text(150, fmt_ts(now - self.t0))
-        elif st == "call":
-            if int(now * 2) % 2 == 0:
-                dot(t["pink"])
-            text(40, "CALL")
-            self._bars(100)
-            text(200, fmt_ts(now - self.t0))
-        else:
-            lab = self._label(st)
-            if lab:
-                dot({"done": t["green"], "nospeech": t["muted"],
-                     "call_queued": t["muted"]}.get(st, t["yellow"]))
-                text(44, lab[0], lab[1])
-                if lab[2]:  # thin progress bar along the bottom of the pill
-                    p = self.app.progress() or 0
-                    x0, x1, y = 44, self.W - 26, self.H - 10
-                    c.create_rectangle(x0, y, x1, y + 3, fill="#2a2a4a", outline="")
-                    c.create_rectangle(x0, y, x0 + (x1 - x0) * p, y + 3, fill=t["cyan"],
-                                       outline="")
-        if st in self.X_STATES:  # small cancel X, top right
-            cx, cy, r = self.W - 20, 15, 4
-            c.create_line(cx - r, cy - r, cx + r, cy + r, fill=t["muted"], width=2)
-            c.create_line(cx - r, cy + r, cx + r, cy - r, fill=t["muted"], width=2)
-
-    def run(self) -> None:
-        self.root.mainloop()
-
-
-# --------------------------------------------------------------------------
-# App
-# --------------------------------------------------------------------------
-
 class App:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.rules = compile_replacements(cfg.get("replacements") or {})
         self.engine = Engine(cfg)
         self.recorder = Recorder(cfg["input_device"])
-        self.widget: Widget | None = None
+        self.widget = None   # ui_qt.QtWidget, created in main()
         self.hotkeys: Hotkeys | None = None
         self.lock = threading.RLock()
         self.mode = "idle"       # "idle" | "dictation" | "call"
@@ -3576,7 +2957,7 @@ class App:
                            "  Fedora:        sudo dnf install zenity\n"
                            "  Debian/Ubuntu: sudo apt install zenity\n\n"
                            "Then try again. Close this window to continue.")
-        self.widget.send("pick_file")  # fallback: tkinter dialog on the tkinter thread
+        self.widget.send("pick_file")  # fallback: Qt's own file dialog
 
     def _native_pick(self, cmd) -> None:
         try:
@@ -3721,7 +3102,7 @@ def check_dependencies() -> None:
     groups = [
         ("REQUIRED", [("moondream", "moondream"), ("numpy", "numpy"),
                       ("sounddevice", "sounddevice"), ("pynput", "pynput"),
-                      ("pyperclip", "pyperclip")]),
+                      ("pyperclip", "pyperclip"), ("PySide6", "PySide6-Essentials")]),
         ("optional (audio file import)", [("soundfile", "soundfile"), ("scipy", "scipy")]),
         ("optional (speaker labels)", [("diarize", "diarize")]),
         ("optional (smarter name highlighting)", [("spacy", "spacy")]),
@@ -3886,12 +3267,15 @@ def main() -> None:
     load_speeds()
     NER_MODELS[:] = [cfg["ner_model"]] + [n for n in NER_MODELS if n != cfg["ner_model"]]
     try:
-        import tkinter  # noqa: F401
+        from PySide6 import QtWidgets  # noqa: F401
     except ImportError:
-        sys.exit("tkinter is missing. On Debian/Ubuntu: sudo apt install python3-tk")
+        sys.exit("PySide6 is missing (the window toolkit). Run: pip install PySide6-Essentials")
 
     app = App(cfg)
-    app.widget = Widget(app)
+    import ui_qt
+
+    ui_qt.init(sys.modules[__name__])
+    app.widget = ui_qt.QtWidget(app)
     app.hotkeys = Hotkeys(app)
     app.hotkeys.start()
     app.remote = RemoteServer(app)
@@ -3902,7 +3286,7 @@ def main() -> None:
     app.start_portals()
     app.load_in_background()
     try:
-        app.widget.run()  # tkinter must own the main thread
+        app.widget.run()  # Qt owns the main thread
     except KeyboardInterrupt:
         app.quit()
 
