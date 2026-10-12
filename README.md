@@ -39,8 +39,9 @@ fails to install, the core app still works. At startup PyKeet logs which package
 missing and the exact `pip` command for the Python it is running. Always run `python main.py` from
 the same terminal/venv you installed into.
 
-Linux also needs system packages. Debian/Ubuntu: `sudo apt install python3-tk xclip libportaudio2 libnotify-bin`.
-Fedora: `sudo dnf install python3-tkinter xclip portaudio libnotify`.
+Linux also needs system packages. Debian/Ubuntu: `sudo apt install xclip libportaudio2 libnotify-bin libxcb-cursor0`.
+Fedora: `sudo dnf install xclip portaudio libnotify xcb-util-cursor`. The windows use Qt 6
+(`PySide6-Essentials`, installed by `requirements.txt`, about 250 MB), which talks to Wayland natively.
 `config.toml` is created next to `main.py` on first run. The first start loads the model (a download
 the first time, then fully offline); the floating pill and a notification say when it is ready.
 
@@ -190,12 +191,14 @@ for you. PyKeet works around it (**written without access to a Wayland machine, 
 3. Inserting text: PyKeet cannot press Ctrl+V for you, so it **copies the text and shows a
    notification - press Ctrl+V**. For automatic typing, install `ydotool`, run its daemon, and
    give yourself write access to `/dev/uinput` (udev rule); PyKeet then uses it automatically.
-4. Mic, file picker and notifications work as before. The floating pill runs through XWayland
-   and may not stay on top; the log and notifications are the reliable feedback.
+4. Mic, file picker and notifications work as before. **Wayland windows cannot choose their
+   position or stay above other windows** (a Wayland rule, not a PyKeet one), so the floating pill
+   appears wherever GNOME puts it and may sit behind the app you're in. If it steals keyboard focus
+   from the app you dictate into, set `show_pill = false`; notifications still tell you the state.
 
 **Python on Fedora 43:** the system Python becomes 3.14, and your `.venv` (built on 3.13) will
 probably break. Rebuild it:
-`sudo dnf install python3.13 python3.13-tkinter`, then
+`sudo dnf install python3.13 python3.13-devel`, then
 `python3.13 -m venv .venv && source .venv/bin/activate`, then the CPU-only torch command and
 `pip install -r requirements.txt` from the Install section.
 
@@ -208,7 +211,7 @@ Set `wayland_portals = true` in `config.toml` and `pip install jeepney`. Then:
   (GNOME 48+), which reports key press *and* release, so `dictation_mode = "push"` can work.
   GNOME shows a dialog to confirm the keys. If you ran `--install-gnome-shortcuts` earlier,
   remove those custom shortcuts first (Settings > Keyboard) or each key fires twice.
-- **Feedback:** the floating pill runs through XWayland and may not show or stay on top. With
+- **Feedback:** the floating pill is positioned by GNOME and may not stay on top. With
   `wayland_status_notifications = true` you get small "Recording / Transcribing / Done"
   notifications instead. PyKeet has no tray icon.
 - Anything the desktop refuses falls back to the Stage 1 behaviour, and the reason is in the log.
@@ -219,13 +222,14 @@ Select text in any app (email draft, dictation result) and press **Ctrl+Alt+P**.
 and reads it aloud one short phrase at a time, highlighting the phrase being spoken. When
 something sounds wrong press **Space**: the word you just heard is flagged red (press Space
 again on it to unflag; PyKeet allows `proofread_reaction_seconds` for your reaction time).
-**P** pauses, **Left/Right** go back/skip. At the end, **Copy flagged list** or **Copy with
-[CHECK] marks** gives you the places to fix.
+**P** pauses, **Left/Right** go back/skip. Finish with a copy button (it also closes the window).
 
-**Long dictations ask first.** When a dictation is 3+ sentences (`review_min_sentences`) it is
-not pasted straight away. A window shows it: **Enter** reads it back to you (and you can flag
-mistakes), **Esc** pastes it and closes. Turn off with `review_long_dictation = false`.
-If GNOME refuses to give that window keyboard focus, click it once.
+**Long dictations are read back first.** When a dictation is 3+ sentences (`review_min_sentences`)
+it is not pasted straight away. A window opens and starts reading it to you at once; press
+**Space** when a word sounds wrong. Four buttons: **Rewind to start** (and play), **Pause/Resume**,
+**Copy with [CHECK] marks and close** and **Copy plain and close** (Esc does the same as plain).
+Copying also closes the window, and **you can't start another dictation until it is closed**.
+On Wayland, press Ctrl+V afterwards. Turn off with `review_long_dictation = false`.
 
 **Voices** (`tts_engine = "auto"` tries Kokoro then Piper; install at least one; models download on first use into
 `tts-models/`):
@@ -266,7 +270,7 @@ a word either side. Piper's download and voices were not tested here; Kokoro was
   on macOS is untested.
 - **Windows:** elevated (admin) apps ignore simulated keys from a non-elevated script.
 - **Clipboard restore** handles text only; if you had an image on the clipboard it is not put back.
-- **Widget corners** are truly transparent only on Windows; elsewhere it is a dark pill on a rectangle.
+- **Pill position and always-on-top** work on X11/Windows/macOS but not on Wayland (see above).
 - **Licences:** Parakeet weights are CC-BY-4.0, `diarize` is Apache 2.0. Check the moondream / Photon
   engine licence separately before publishing this as open source.
 - Logs go to `pykeet.log` (rotating). Transcript text is only logged when `debug = true`.

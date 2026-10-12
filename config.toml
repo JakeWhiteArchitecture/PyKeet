@@ -139,13 +139,19 @@ proofread_phrase_words = 14      # longest phrase read at once (smaller = more p
 proofread_reaction_seconds = 0.5
 
 # When a dictation is this many sentences or longer, show it in a window first instead of
-# pasting straight away:  Enter = read it back to me (and flag mistakes),  Esc = paste it now.
+# pasting straight away. It reads the text back to you at once (SPACE flags a word you think
+# is wrong). "Copy plain and close" (or Esc) pastes it; the other button pastes it with
+# [CHECK] marks at your flags. No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
 
 # --- Misc ------------------------------------------------------------------
-# [x, y] of the floating widget; empty = bottom centre. Updated when you drag it.
+# [x, y] of the floating widget; empty = bottom centre. Updated when you drag it. (Not used on
+# Wayland, where the desktop decides where windows go.)
 widget_position = []
+# false = never show the floating pill (you still get notifications). Useful if, on Wayland,
+# the pill steals the keyboard focus from the app you are dictating into.
+show_pill = true
 debug = false             # true = transcript text is allowed in the log
 
 # Spoken -> written. Case-insensitive, applied in dictation and call mode.
