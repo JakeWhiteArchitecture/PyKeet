@@ -34,7 +34,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "1.7"
+VERSION = "1.8"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -2396,12 +2396,59 @@ def count_sentences(text: str) -> int:
 
 
 # --------------------------------------------------------------------------
+# Look: dark navy + purple outlines + neon accents
+# --------------------------------------------------------------------------
+
+THEME = {"bg": "#0b0e2a", "card": "#1a1a2e", "border": "#4a1d96", "text": "#f2f2f8",
+         "muted": "#8d93b8", "cyan": "#00d4ff", "pink": "#ff0080", "green": "#39ff14",
+         "yellow": "#ffcc00", "purple": "#4a1d96"}
+
+
+def apply_theme(win) -> None:
+    """Restyle a Tk window and everything in it with THEME (call after building it)."""
+    import tkinter as tk
+
+    t = THEME
+    default_bg = win.cget("bg")
+
+    def walk(w):
+        cls = w.winfo_class()
+        try:
+            if cls in ("Frame", "Toplevel"):
+                w.configure(bg=t["bg"])
+            elif cls == "Label":
+                if w.cget("bg") == default_bg:  # leave the colour-coded legend labels alone
+                    muted = str(w.cget("fg")) in ("#777", "#777777")
+                    w.configure(bg=t["bg"], fg=t["muted"] if muted else t["text"])
+            elif cls == "Button":
+                w.configure(bg=t["card"], fg=t["cyan"], activebackground=t["purple"],
+                            activeforeground=t["text"], relief="flat", bd=0, padx=12, pady=5,
+                            highlightthickness=1, highlightbackground=t["border"],
+                            highlightcolor=t["cyan"], cursor="hand2")
+            elif cls == "Text":
+                w.configure(bg=t["card"], fg=t["text"], insertbackground=t["cyan"],
+                            selectbackground=t["purple"], selectforeground=t["text"],
+                            highlightthickness=1, highlightbackground=t["border"], relief="flat")
+            elif cls == "Scrollbar":
+                w.configure(bg=t["border"], troughcolor=t["card"], activebackground=t["purple"],
+                            relief="flat", bd=0)
+        except tk.TclError:
+            pass
+        for child in w.winfo_children():
+            walk(child)
+
+    win.configure(bg=t["bg"])
+    walk(win)
+
+
+# --------------------------------------------------------------------------
 # Floating widget (tkinter, main thread)
 # --------------------------------------------------------------------------
 
 class Widget:
-    W, H = 290, 46
+    W, H = 272, 46
     KEY = "#010101"  # transparent colour on Windows
+    X_STATES = ("rec", "transcribing")   # states that show the cancel X
 
     def __init__(self, app: "App"):
         import tkinter as tk
@@ -2417,7 +2464,7 @@ class Widget:
             self.root.attributes("-alpha", 0.9)
         except tk.TclError:
             pass
-        bg = "#1e1e24"
+        bg = THEME["card"]
         self.canvas = tk.Canvas(self.root, width=self.W, height=self.H,
                                 highlightthickness=0, bg=bg)
         if sys.platform.startswith("win"):
@@ -2431,6 +2478,11 @@ class Widget:
         self.t0 = 0.0
         self.state_since = 0.0
         self.levels: deque = deque([0.0] * 10, maxlen=10)
+        import tkinter.font as tkfont
+
+        self._font = tkfont.Font(family="Segoe UI" if sys.platform.startswith("win")
+                                 else "Helvetica", size=11, weight="bold")
+        self._moved = False
         self._place()
         self.root.withdraw()
         self._no_focus()
@@ -2481,9 +2533,17 @@ class Widget:
         if self._moved:
             self.root.geometry(f"+{wx + dx}+{wy + dy}")
 
+    def _x_hit(self, e) -> bool:
+        return self.state in self.X_STATES and e.x > self.W - 34 and e.y < 30
+
     def _release(self, e):
         if self._moved:
             save_widget_position(self.root.winfo_x(), self.root.winfo_y())
+        elif self._x_hit(e):  # the small X, top right: cancel
+            if self.state == "rec":
+                self.app.post(self.app.cancel_dictation)
+            else:
+                self.app.post(self.app.cancel_transcription)
         elif self.state == "rec":
             self.app.post(self.app.stop_dictation)
         self._drag_origin = None
@@ -2578,8 +2638,8 @@ class Widget:
         sb.pack(side="right", fill="y")
         box.pack(side="left", fill="both", expand=True)
         box.insert("1.0", text)
-        box.tag_configure("now", background="#fff3a8")
-        box.tag_configure("flag", background="#ffb3b3", underline=True)
+        box.tag_configure("now", background=THEME["purple"])
+        box.tag_configure("flag", background=THEME["pink"], underline=True)
         box.tag_raise("flag")
         box.configure(state="disabled")
 
@@ -2711,6 +2771,7 @@ class Widget:
         tk.Button(bar, text="Copy with [CHECK] marks and close", command=lambda: finish(True),
                   takefocus=0).pack(side="right", padx=3)
         win.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        apply_theme(win)
         win.lift()
         win.focus_force()
         box.focus_set()
@@ -2841,6 +2902,9 @@ class Widget:
                 side="left", padx=6)
             tk.Label(bar, text=str(path), anchor="w", fg="#777").pack(side="left", padx=6)
         tk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        apply_theme(win)
+        text.tag_configure("bullet", foreground=THEME["muted"])
+        text.tag_configure("ts", foreground=THEME["muted"])
         win.lift()
         win.focus_force()
 
@@ -2852,11 +2916,15 @@ class Widget:
         if paths:
             self.app.post(lambda: self.app.import_files(paths))
 
+    def _pill_shape(self, x0, y0, x1, y1, fill) -> None:
+        c, h = self.canvas, y1 - y0
+        c.create_oval(x0, y0, x0 + h, y1, fill=fill, outline=fill)
+        c.create_oval(x1 - h, y0, x1, y1, fill=fill, outline=fill)
+        c.create_rectangle(x0 + h / 2, y0, x1 - h / 2, y1, fill=fill, outline=fill)
+
     def _pill(self, fill: str) -> None:
-        c, w, h = self.canvas, self.W, self.H
-        c.create_oval(0, 0, h, h, fill=fill, outline=fill)
-        c.create_oval(w - h, 0, w, h, fill=fill, outline=fill)
-        c.create_rectangle(h / 2, 0, w - h / 2, h, fill=fill, outline=fill)
+        self._pill_shape(0, 0, self.W, self.H, THEME["border"])      # purple outline
+        self._pill_shape(2, 2, self.W - 2, self.H - 2, fill)
 
     def _bars(self, x0: int) -> None:
         self.levels.append(min(1.0, (self.app.recorder.level * 9) ** 0.6))
@@ -2864,58 +2932,92 @@ class Widget:
             bh = 4 + lv * 26
             x = x0 + i * 9
             self.canvas.create_rectangle(x, self.H / 2 - bh / 2, x + 5, self.H / 2 + bh / 2,
-                                         fill="#e8e8ee", outline="")
+                                         fill=THEME["cyan"], outline="")
+
+    def _label(self, st: str):
+        """(text, colour, show_progress) for the states that are a dot plus one line of text."""
+        t = THEME
+        bg_note = self.app.bg_note
+        if st == "transcribing":
+            return "Transcribing…", t["text"], False
+        if st == "call_preparing":
+            return "Preparing…" + bg_note, t["text"], False
+        if st == "call_queued":
+            return "Waiting for a free worker…" + bg_note, t["muted"], False
+        if st in ("call_transcribing", "call_labelling"):
+            p = self.app.progress()
+            pct = f" ~{int(p * 100)}%" if p is not None else ""
+            return (("Transcribing" if st == "call_transcribing" else "Labelling speakers")
+                    + bg_note + pct), t["text"], p is not None
+        if st == "done":
+            return "Done", t["green"], False
+        if st == "nospeech":
+            return "No speech", t["muted"], False
+        return None
+
+    def _fit(self, st: str) -> None:
+        """Size the pill to what it shows, so no text is cut off."""
+        lab = self._label(st)
+        if st == "rec":
+            w = 272
+        elif st == "call":
+            w = 290
+        elif lab:
+            extra = 36 if st in self.X_STATES else 18
+            w = max(170, 44 + self._font.measure(lab[0]) + extra)
+            if lab[2]:
+                w = max(w, 240)  # room for the progress bar
+        else:
+            return
+        w = min(w, 520)
+        if w != self.W:
+            self.W = w
+            self.canvas.configure(width=w)
+            self.root.geometry(f"{w}x{self.H}")
 
     def _draw(self) -> None:
+        t = THEME
+        st = self.state
+        self._fit(st)
         c = self.canvas
         c.delete("all")
         self._pill(self.bg)
         now = time.monotonic()
-        st = self.state
         font = ("Segoe UI", 11, "bold") if sys.platform.startswith("win") else ("Helvetica", 11, "bold")
         mid = self.H / 2
 
         def dot(color):
             c.create_oval(18, mid - 7, 32, mid + 7, fill=color, outline=color)
 
-        def text(x, s, color="#f2f2f5"):
+        def text(x, s, color=t["text"]):
             c.create_text(x, mid, text=s, fill=color, font=font, anchor="w")
 
         if st == "rec":
-            dot("#ff4040")
+            dot(t["pink"])
             self._bars(44)
             text(150, fmt_ts(now - self.t0))
         elif st == "call":
             if int(now * 2) % 2 == 0:
-                dot("#ff4040")
+                dot(t["pink"])
             text(40, "CALL")
             self._bars(100)
             text(200, fmt_ts(now - self.t0))
-        elif st == "transcribing":
-            dot("#ffb020")
-            text(44, "Transcribing…")
-        elif st == "call_preparing":
-            dot("#ffb020")
-            text(44, "Preparing…" + self.app.bg_note)
-        elif st == "call_queued":
-            dot("#8a8a92")
-            text(44, "Waiting for a free worker…" + self.app.bg_note)
-        elif st in ("call_transcribing", "call_labelling"):
-            dot("#ffb020")
-            p = self.app.progress()
-            pct = f" ~{int(p * 100)}%" if p is not None else ""
-            text(44, ("Transcribing" if st == "call_transcribing" else "Labelling speakers")
-                 + self.app.bg_note + pct)
-            if p is not None:  # thin progress bar along the bottom of the pill
-                x0, x1, y = 44, self.W - 26, self.H - 9
-                c.create_rectangle(x0, y, x1, y + 3, fill="#3a3a44", outline="")
-                c.create_rectangle(x0, y, x0 + (x1 - x0) * p, y + 3, fill="#ffb020", outline="")
-        elif st == "done":
-            dot("#40d070")
-            text(44, "Done", "#40d070")
-        elif st == "nospeech":
-            dot("#8a8a92")
-            text(44, "No speech", "#b0b0b8")
+        else:
+            lab = self._label(st)
+            if lab:
+                dot({"done": t["green"], "nospeech": t["muted"],
+                     "call_queued": t["muted"]}.get(st, t["yellow"]))
+                text(44, lab[0], lab[1])
+                if lab[2]:  # thin progress bar along the bottom of the pill
+                    p = self.app.progress() or 0
+                    x0, x1, y = 44, self.W - 26, self.H - 10
+                    c.create_rectangle(x0, y, x1, y + 3, fill="#2a2a4a", outline="")
+                    c.create_rectangle(x0, y, x0 + (x1 - x0) * p, y + 3, fill=t["cyan"],
+                                       outline="")
+        if st in self.X_STATES:  # small cancel X, top right
+            cx, cy, r = self.W - 20, 15, 4
+            c.create_line(cx - r, cy - r, cx + r, cy + r, fill=t["muted"], width=2)
+            c.create_line(cx - r, cy + r, cx + r, cy - r, fill=t["muted"], width=2)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -2954,6 +3056,7 @@ class App:
         self.bg_phase: str | None = None
         self.bg_note = ""
         self.portal = None
+        self._cancel_tx = False    # X pressed while transcribing: drop the result
         self.review_open = False   # read-back window showing: no new dictation until it is closed
         self._wl_status = is_wayland() and bool(cfg["wayland_status_notifications"])
         self._disp: dict | None = None   # the job the pill shows
@@ -3203,6 +3306,13 @@ class App:
         if self.cfg["dictation_mode"] == "push":
             self.stop_dictation()
 
+    def cancel_transcription(self) -> None:
+        """The pill's X while transcribing. The model finishes its work, but nothing is pasted."""
+        if self.mode == "dictation" and self.phase == "processing":
+            self._cancel_tx = True
+            log.info("dictation: transcription cancelled (result will be dropped)")
+            self.ui("hidden")
+
     def review_reminder(self) -> None:
         self.notify("PyKeet", "Finish with the read-back window first: copy and close it.")
 
@@ -3220,6 +3330,7 @@ class App:
                 self.ui("nospeech")
                 return
             self.mode, self.phase = "dictation", "recording"
+            self._cancel_tx = False
         if self.cfg["dictation_beep"]:
             beep(True)
         self.ui("rec")
@@ -3274,6 +3385,9 @@ class App:
                      elapsed, time.monotonic() - t, len(text))
             if self.cfg["debug"]:
                 log.debug("dictation text: %r", text)
+            if self._cancel_tx:
+                self._cancel_tx = False
+                return
             if not text.strip():
                 self.ui("nospeech")
                 return
