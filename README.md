@@ -7,7 +7,7 @@ No cloud, no account, no word limits.
 - **Call mode:** press `Ctrl+Alt+R` at the start of a speakerphone call and again at the end. A timestamped, speaker-labelled Markdown transcript is saved to `~/CallTranscripts/`.
 
 > **Status:** the pure logic (text cleanup, replacements, speaker assignment, transcript format,
-> crash-recovery of WAVs) is tested. The hotkeys, widget, tray, microphone and model calls need a real
+> crash-recovery of WAVs) is tested. The hotkeys, widget, microphone and model calls need a real
 > desktop, so run the acceptance tests in the spec on your own machine before relying on it.
 > One assumption to check first: the exact layout of Parakeet's `timestamps="word"` result
 > (`extract_units()` in `main.py` accepts words at top level, words inside segments, or plain segments).
@@ -24,7 +24,7 @@ python -m venv .venv
 pip install --no-cache-dir torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
 
 pip install --no-cache-dir -r requirements.txt            # core: dictation + calls
-pip install --no-cache-dir -r requirements-optional.txt   # tray icon, file import, speaker labels
+pip install --no-cache-dir -r requirements-optional.txt   # file import, speaker labels, name highlighting, Wayland portals, voices
 python main.py
 ```
 
@@ -42,7 +42,7 @@ the same terminal/venv you installed into.
 Linux also needs system packages. Debian/Ubuntu: `sudo apt install python3-tk xclip libportaudio2 libnotify-bin`.
 Fedora: `sudo dnf install python3-tkinter xclip portaudio libnotify`.
 `config.toml` is created next to `main.py` on first run. The first start loads the model (a download
-the first time, then fully offline); the tray shows "Ready." when it is done.
+the first time, then fully offline); the floating pill and a notification say when it is ready.
 
 **Quit Vibe Typer first.** Both apps want `Ctrl+Space`.
 
@@ -54,14 +54,15 @@ the first time, then fully offline); the tray shows "Ready." when it is done.
 | `F8` | Re-insert the last dictation |
 | `Esc` while recording | Discard |
 | `Ctrl+Alt+R` | Start / stop call recording |
-| `Ctrl+Alt+O` | Open the audio file picker (same as the tray item) |
+| `Ctrl+Alt+O` | Open the audio file picker  |
 
 Widget: click while dictating = stop and insert, right-click = cancel. It is draggable and remembers its
-position. During a call it shows "CALL" and ignores clicks; stop with the shortcut or the tray menu.
+position. During a call it shows "CALL" and ignores clicks; stop with the shortcut.
 While a call is being recorded the dictation shortcut is disabled.
 
-Tray menu: Start/Stop call, Transcribe audio file…, Pause dictation, Show last transcript (opens the latest call transcript),
-Open call transcripts, Open config, Quit.
+There is no tray icon. Other actions are commands you can bind to a shortcut or run in a terminal:
+`python main.py --show-last` (open the latest call transcript), `--pause` (pause/resume dictation),
+`--quit`, `--import`, `--toggle-call`, `--toggle-dictation`.
 
 ## Config
 
@@ -75,7 +76,7 @@ first time you record a call).
 
 ## Transcribing an audio file
 
-Tray menu > **Transcribe audio file…** (or `Ctrl+Alt+O`, handy if your desktop has no tray) opens your desktop's own file dialog (via `zenity` on GNOME, `kdialog` on KDE, so you get your usual sidebar
+**Ctrl+Alt+O** (or `python main.py --import`) opens your desktop's own file dialog (via `zenity` on GNOME, `kdialog` on KDE, so you get your usual sidebar
 and bookmarks; on Fedora `sudo dnf install zenity` if it is missing; set `native_file_picker = false` to use the
 basic built-in dialog) for `.mp3`, `.ogg`, `.flac` and `.wav` (pick
 several to batch them). Each file is decoded to 16 kHz mono, transcribed with the call settings
@@ -108,7 +109,7 @@ file can't be read, a window shows the exact reason.
   is never clipped; shorter pauses are untouched. A silence is only cut once speech has clearly resumed
   after it, and the level adapts to your room noise (set `dictation_silence_threshold_db` to a number like
   `-45` to override). Calls, meetings and imported audio files are **not** trimmed.
-- **Transcript viewer.** Imported files, and tray > Show last transcript, open a small Markdown viewer
+- **Transcript viewer.** Imported files, and `--show-last`, open a small Markdown viewer
   (headings, bold speaker names, grey timestamps). Names / proper nouns (blue), phone numbers (green),
   addresses and postcodes (orange), companies (purple) and emails (teal) are coloured. This is
   rule-based guesswork, not AI: it will miss some and mark some places or products as names. Add anyone
@@ -120,6 +121,40 @@ file can't be read, a window shows the exact reason.
   `pip install spacy` then `python -m spacy download en_core_web_md` (use `en_core_web_sm` for the
   12 MB version). PyKeet uses it automatically (`use_ner = true`) and falls back to the simple rules if
   it is missing. It is still a statistical guess and will occasionally mislabel something.
+- **Decisions and tasks.** The viewer underlines sentences about a decision to make (amber), options
+  (magenta), a decision made (green), a task to do (blue) and a task done (grey), and "Action summary"
+  lists them all by type with their timestamps. By default this uses simple phrase rules (English):
+  good on clear wording ("we've decided to go with larch", "I'll send the drawings"), poor on natural
+  speech ("so yeah we'll go larch"). For better results set `action_model` in `config.toml` to a small
+  zero-shot AI model, e.g. `MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33` (needs
+  `pip install transformers`; downloads once; runs in the background after the viewer opens, with the
+  rules shown straight away). A small chat language model can be used instead: `action_backend = "llm"` with
+  `action_model = "Qwen/Qwen2.5-0.5B-Instruct"` (about 1 GB; understands wording better than the
+  classifier but takes minutes on a long call; `Qwen2.5-1.5B-Instruct` is better and slower; models
+  under ~0.5B such as Gemma 3 270M are usually too small to be reliable). It is shown worked examples
+  and picks an answer letter for each sentence. **Needle 3** (Cactus Compute, Apache-2.0) is the lightest option: a tiny 8-29 MB tool-calling model
+  that runs on the CPU and installs with almost nothing (`pip install cactus-needle`). Set
+  `action_backend = "needle"`. Each label becomes a "tool" and the model picks one per sentence (or
+  none). Good to know: the first use downloads the model and a small native engine library from
+  Hugging Face (after that it works offline), and the package would send anonymous usage pings by
+  default, which PyKeet switches off (`NEEDLE_TELEMETRY=0`). It is built for phone-style tool calls, so
+  test it on a real transcript before trusting it.
+**Teach it with example phrases.** `action_backend = "phrases"` compares each sentence with the example
+  phrases in `action_phrases.toml` (created on first use with about a dozen per type plus a "none" group of
+  ordinary chat; edit it freely and add phrases from your own meetings). With no install it matches by
+  word overlap: on my 50-sentence check it lifted messy speech from 4/14 to 8/14 when combined with the
+  rules, with one more false hit, so it is a modest help. `action_backend = "needle-phrases"` compares the
+  same phrases by *meaning* using Needle 3's embeddings (so "we'll go larch" can match "let's go with
+  that"); that one is untested on real speech. See why a sentence got its label with To compare backends or models on your own machine, set `action_backend` /
+  `action_model` and run `python main.py --evaluate`: it scores the rules, the model alone and the two
+  combined on 50 labelled sentences, shows the time per sentence and lists what is still wrong.
+  `python main.py --explain "so yeah I think we'll go larch"`.
+You can also point PyKeet at a model server you run yourself:
+  `action_backend = "server"` and `action_server = "http://127.0.0.1:8080"` (llama.cpp's
+  `llama-server`, Ollama, LM Studio, or Microsoft's `bitnet.cpp` server for ternary BitNet models
+  such as BitNet b1.58 2B4T, which is about 0.4 GB and fast on a CPU but needs its own build, see its
+  README). PyKeet sends each sentence with the worked examples and reads the one-letter answer.
+  Treat both as a guide, not minutes: always check against the transcript.
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
@@ -139,7 +174,72 @@ For better call audio: phone right next to the mic, quiet room, ideally a USB co
 typing near the mic.
 
 Notifications: on Linux (with `notify-send`) clicking "Open" opens the transcript. On Windows/macOS the
-tray notification cannot be clicked through, so use the tray's "Show last transcript".
+notification cannot be clicked through, so run `python main.py --show-last`.
+
+## Wayland / Fedora 43 (GNOME)
+
+Fedora 43 removes the X11 session, so apps can no longer listen for keys globally or press keys
+for you. PyKeet works around it (**written without access to a Wayland machine, so untested**):
+
+1. Start PyKeet as normal, then once run `python main.py --install-gnome-shortcuts`. GNOME now
+   owns the shortcuts (Settings > Keyboard > Custom Shortcuts) and runs
+   `python main.py --toggle-dictation` etc., which message the running PyKeet.
+   On other desktops, `python main.py --shortcut-commands` prints the commands to bind.
+2. Shortcuts are **press to start, press again to stop**. Hold-to-talk and the Esc cancel key
+   are not available on Wayland (Esc cannot be a global shortcut).
+3. Inserting text: PyKeet cannot press Ctrl+V for you, so it **copies the text and shows a
+   notification - press Ctrl+V**. For automatic typing, install `ydotool`, run its daemon, and
+   give yourself write access to `/dev/uinput` (udev rule); PyKeet then uses it automatically.
+4. Mic, file picker and notifications work as before. The floating pill runs through XWayland
+   and may not stay on top; the log and notifications are the reliable feedback.
+
+**Python on Fedora 43:** the system Python becomes 3.14, and your `.venv` (built on 3.13) will
+probably break. Rebuild it:
+`sudo dnf install python3.13 python3.13-tkinter`, then
+`python3.13 -m venv .venv && source .venv/bin/activate`, then the CPU-only torch command and
+`pip install -r requirements.txt` from the Install section.
+
+### Wayland stages 2-4 (all optional, all untested on real GNOME)
+
+Set `wayland_portals = true` in `config.toml` and `pip install jeepney`. Then:
+- **Typing:** at start GNOME asks once to let PyKeet control the keyboard (the answer is
+  remembered). Dictated text is then typed into the focused app, no Ctrl+V needed.
+- **Hold-to-talk:** PyKeet registers the shortcuts itself through the GlobalShortcuts portal
+  (GNOME 48+), which reports key press *and* release, so `dictation_mode = "push"` can work.
+  GNOME shows a dialog to confirm the keys. If you ran `--install-gnome-shortcuts` earlier,
+  remove those custom shortcuts first (Settings > Keyboard) or each key fires twice.
+- **Feedback:** the floating pill runs through XWayland and may not show or stay on top. With
+  `wayland_status_notifications = true` you get small "Recording / Transcribing / Done"
+  notifications instead. PyKeet has no tray icon.
+- Anything the desktop refuses falls back to the Stage 1 behaviour, and the reason is in the log.
+
+## Proofreading: have the text read back to you
+
+Select text in any app (email draft, dictation result) and press **Ctrl+Alt+P**. A window opens
+and reads it aloud one short phrase at a time, highlighting the phrase being spoken. When
+something sounds wrong press **Space**: the word you just heard is flagged red (press Space
+again on it to unflag; PyKeet allows `proofread_reaction_seconds` for your reaction time).
+**P** pauses, **Left/Right** go back/skip. At the end, **Copy flagged list** or **Copy with
+[CHECK] marks** gives you the places to fix.
+
+**Long dictations ask first.** When a dictation is 3+ sentences (`review_min_sentences`) it is
+not pasted straight away. A window shows it: **Enter** reads it back to you (and you can flag
+mistakes), **Esc** pastes it and closes. Turn off with `review_long_dictation = false`.
+If GNOME refuses to give that window keyboard focus, click it once.
+
+**Voices** (`tts_engine = "auto"` tries Kokoro then Piper; install at least one; models download on first use into
+`tts-models/`):
+1. **Kokoro** - the most natural. `pip install kokoro-onnx`. About 120 MB of models and
+   0.5-1 GB RAM while speaking (tested here: ~400 MB, int8 model, faster than real time).
+   Change voice with `kokoro_voice` (UK: bf_emma, bf_isabella, bm_george, bm_lewis).
+2. **Piper** - lighter, flatter. `pip install piper-tts`. `piper_noise_scale` makes it livelier.
+
+Word-level flags use estimated word timings (the voice doesn't report them), so a flag can land
+a word either side. Piper's download and voices were not tested here; Kokoro was.
+- On Wayland, select the text and press the shortcut; if nothing is picked up, press Ctrl+C
+  first (PyKeet falls back to the clipboard).
+- It catches what *sounds* wrong (mis-heard words, garbled names), not mistakes that sound
+  identical when spoken, like there/their.
 
 ## Autostart on login
 

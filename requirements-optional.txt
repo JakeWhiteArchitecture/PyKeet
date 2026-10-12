@@ -1,7 +1,4 @@
 # Optional extras. Install separately so a failure here can't block the core install.
-# Tray icon + audio file picker menu
-pystray
-Pillow
 # Audio file import (mp3/ogg/flac/wav)
 soundfile
 scipy
@@ -10,3 +7,13 @@ diarize
 # Smarter name / company / place highlighting in the transcript viewer (small, ~100 MB).
 # After installing, also run:  python -m spacy download en_core_web_md
 spacy
+# Optional, for the AI decision/task detector (config: action_model). Uses the PyTorch you have.
+# transformers
+# Optional, tiny decision/task detector (config: action_backend = "needle"). ~no dependencies.
+# cactus-needle
+# Optional, Wayland only (config: wayland_portals = true): type text and register global
+# shortcuts through the desktop portals. Pure Python, tiny.
+jeepney
+# Optional, proofreader voices (config: tts_engine). Kokoro is livelier, Piper lighter.
+kokoro-onnx
+# piper-tts
