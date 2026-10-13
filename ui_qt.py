@@ -558,7 +558,7 @@ class ViewerWindow(QtWidgets.QWidget):
 
 class ProofWindow(QtWidgets.QWidget):
     """Reads the text aloud from the start; SPACE flags the word being spoken. Two buttons
-    copy and close in one step (with [CHECK] marks, or plain). For a dictation (review_cb)
+    copy and close in one step (rich text with highlights, or plain). For a dictation (review_cb)
     the chosen text is handed back to be pasted and dictation stays blocked until closed."""
 
     def __init__(self, ui: QtWidget, text: str, review_cb=None):
@@ -596,7 +596,7 @@ class ProofWindow(QtWidgets.QWidget):
         self.rewind.clicked.connect(self.sess.restart)
         self.pause = QtWidgets.QPushButton("Pause")
         self.pause.clicked.connect(self.sess.toggle_pause)
-        marked = QtWidgets.QPushButton("Copy with [CHECK] marks and close")
+        marked = QtWidgets.QPushButton("Copy with highlights and close")
         marked.clicked.connect(lambda: self.finish(True))
         plain = QtWidgets.QPushButton("Copy plain and close")
         plain.clicked.connect(lambda: self.finish(False))
@@ -722,12 +722,20 @@ class ProofWindow(QtWidgets.QWidget):
         if self.done:
             return
         self.done = True
-        out = self.sess.marked_text() if marked else self.text
         self.sess.stop()
         self.timer.stop()
-        if not self.review_cb:
-            QtGui.QGuiApplication.clipboard().setText(out)
+        clip = QtGui.QGuiApplication.clipboard()
         cb = self.review_cb
+        if marked:  # rich text: flagged words highlighted, plain text as the fallback
+            mime = QtCore.QMimeData()
+            mime.setHtml(self.sess.html())
+            mime.setText(self.text)
+            clip.setMimeData(mime)
+            out = None  # already on the clipboard; nothing to type in
+        else:
+            out = self.text
+            if not cb:
+                clip.setText(out)
         self.close()
         if cb:  # give focus back to the app you were in, then paste
             QTimer.singleShot(300, lambda: cb(out))

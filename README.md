@@ -227,7 +227,7 @@ again on it to unflag; PyKeet allows `proofread_reaction_seconds` for your react
 **Long dictations are read back first.** When a dictation is 3+ sentences (`review_min_sentences`)
 it is not pasted straight away. A window opens and starts reading it to you at once; press
 **Space** when a word sounds wrong. Four buttons: **Rewind to start** (and play), **Pause/Resume**,
-**Copy with [CHECK] marks and close** and **Copy plain and close** (Esc does the same as plain).
+**Copy with highlights and close** (rich text: flagged words highlighted, pastes straight into an email) and **Copy plain and close** (Esc does the same as plain).
 Copying also closes the window, and **you can't start another dictation until it is closed**.
 On Wayland, press Ctrl+V afterwards. Turn off with `review_long_dictation = false`.
 

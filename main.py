@@ -196,7 +196,7 @@ proofread_reaction_seconds = 0.5
 # When a dictation is this many sentences or longer, show it in a window first instead of
 # pasting straight away. It reads the text back to you at once (SPACE flags a word you think
 # is wrong). "Copy plain and close" (or Esc) pastes it; the other button pastes it with
-# [CHECK] marks at your flags. No new dictation can start until the window is closed.
+# highlighted flags (rich text, ready to paste into an email). No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
 
@@ -2386,13 +2386,21 @@ class ProofSession:
             return "Nothing flagged."
         return "\n".join(f"- {self._context(a, b)}" for a, b in sorted(self.flags))
 
-    def marked_text(self, marker: str = "[CHECK] ") -> str:
+    def html(self, colour: str = "#ffe14d") -> str:
+        """The text as HTML with each flagged word highlighted (for pasting into an email)."""
+        import html as _html
+
         out, last = [], 0
-        for a, _b in sorted(self.flags):
-            out += [self.text[last:a], marker]
-            last = a
-        out.append(self.text[last:])
-        return "".join(out)
+        for a, b in sorted(self.flags):
+            if a < last:
+                continue
+            out.append(_html.escape(self.text[last:a]))
+            out.append(f'<span style="background-color:{colour};">'
+                       f'{_html.escape(self.text[a:b])}</span>')
+            last = b
+        out.append(_html.escape(self.text[last:]))
+        paras = [p.replace("\n", "<br>") for p in re.split(r"\n\s*\n", "".join(out))]
+        return "<html><body>" + "".join(f"<p>{p}</p>" for p in paras if p.strip()) + "</body></html>"
 
 
 def count_sentences(text: str) -> int:
@@ -2788,9 +2796,14 @@ class App:
         finally:
             self._set_idle()
 
-    def _finish_review(self, text: str) -> None:
+    def _finish_review(self, text) -> None:
+        """The read-back window closed. text=None means it already put rich text (HTML with the
+        flagged words highlighted) on the clipboard, so there is nothing to type in."""
         self.review_open = False
-        self._insert(text)
+        if text is None:
+            self.notify("PyKeet", "Copied with highlights - press Ctrl+V to paste")
+        else:
+            self._insert(text)
 
     def _insert(self, text: str) -> None:
         try:
