@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "2.2"
+VERSION = "2.3"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -2959,10 +2959,14 @@ class App:
                 self.ui("nospeech")
                 return
             self.last_text = text
-            changed = bool(self.cfg["review_when_changed"]) and bool(compute_changes(raw, text))
-            if (self.cfg["review_long_dictation"] and self.widget
-                    and (count_sentences(text) >= int(self.cfg["review_min_sentences"])
-                         or changed)):
+            n_changes = len(compute_changes(raw, text))
+            n_sent = count_sentences(text)
+            changed = bool(self.cfg["review_when_changed"]) and n_changes > 0
+            opens = bool(self.cfg["review_long_dictation"] and self.widget and (
+                n_sent >= int(self.cfg["review_min_sentences"]) or changed))
+            log.info("dictation: %d sentence(s), %d word change(s) by the cleanup -> read-back "
+                     "window: %s", n_sent, n_changes, "yes" if opens else "no")
+            if opens:
                 # long (or edited): show it first; the window pastes/copies when you close it
                 self.review_open = True
                 self.widget.q.put(("proof", text, lambda t: self.post(
@@ -3434,6 +3438,20 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--evaluate":
         evaluate()
+        return
+    if len(sys.argv) > 2 and sys.argv[1] == "--clean":
+        cfg = load_config()
+        raw = " ".join(sys.argv[2:])
+        out = clean_dictation(raw, compile_replacements(all_replacements(cfg)), True,
+                              bool(cfg["remove_restarts"]), int(cfg["restart_min_words"])).strip()
+        print("Heard:   ", raw)
+        print("Cleaned: ", out)
+        for c in compute_changes(raw, out):
+            now = out[c["start"]:c["end"]]
+            print(f"  {c['kind']}: {c['original']!r} -> {now!r}" if now
+                  else f"  removed: {c['original']!r}")
+        if not compute_changes(raw, out):
+            print("  (no word changes)")
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--corrections":
         table = load_corrections()
