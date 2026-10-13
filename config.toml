@@ -149,6 +149,9 @@ proofread_reaction_seconds = 0.5
 # highlighted flags (rich text, ready to paste into an email). No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
+# Also open the window for a short dictation when the cleanup replaced or removed words
+# (not for capitals, punctuation or um/uh), so you can see what changed and restore it.
+review_when_changed = false
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it. (Not used on
