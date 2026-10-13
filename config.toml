@@ -43,6 +43,11 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
+# Also delete false starts, e.g. "I might start a sentence and actually I might start a
+# sentence" -> "I might start a sentence". Plain rules (no AI), dictation only, never calls.
+# It can wrongly cut something you repeated on purpose; set false to switch it off.
+remove_restarts = true
+restart_min_words = 3     # how many words in a row must repeat (higher = more careful)
 # "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
 # On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
 # it falls back to "clipboard" automatically and shows a notification. See README.

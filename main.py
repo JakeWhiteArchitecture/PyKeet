@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "2.0"
+VERSION = "2.1"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -98,6 +98,11 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
+# Also delete false starts, e.g. "I might start a sentence and actually I might start a
+# sentence" -> "I might start a sentence". Plain rules (no AI), dictation only, never calls.
+# It can wrongly cut something you repeated on purpose; set false to switch it off.
+remove_restarts = true
+restart_min_words = 3     # how many words in a row must repeat (higher = more careful)
 # "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
 # On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
 # it falls back to "clipboard" automatically and shows a notification. See README.
@@ -261,6 +266,8 @@ DEFAULTS = {
     "call_device": "",
     "input_device": "",
     "cleanup": True,
+    "remove_restarts": True,
+    "restart_min_words": 3,
     "insert_method": "paste",
     "use_pynput_on_wayland": False,
     "dictation_beep": False,
@@ -353,11 +360,65 @@ def apply_replacements(text: str, rules) -> str:
     return text
 
 
-def clean_dictation(text: str, rules, cleanup: bool) -> str:
+_JOINERS = {"and", "but", "so", "or", "well", "then"}      # glue between a false start and the restart
+_CORRECTIONS = {"actually", "sorry", "rather", "wait", "no", "mean"}   # "actually", "I mean", "no wait"
+_NUMBERY = re.compile(r"^(?:\d+|oh|zero|nought|one|two|three|four|five|six|seven|eight|nine|ten|"
+                      r"double|triple)$")
+
+
+def remove_restarts(text: str, min_words: int = 3) -> str:
+    """Drop a false start: "I might start a sentence and actually I might start a sentence"
+    becomes "I might start a sentence". Fires only when the start of a phrase is repeated
+    within a few words (min_words or more words in a row), either as a full repeat or after a
+    correction word (actually / sorry / I mean / no wait). Plain rules, no AI model."""
+    toks = text.split()
+    n = len(toks)
+    if n < 2 * min_words:
+        return text
+    norm = [re.sub(r"[^\w']", "", t.lower()) for t in toks]
+    out: list[str] = []
+    i = 0
+    while i < n:
+        cut = None
+        for j in range(i + min_words, min(n, i + 40)):
+            a = j  # where the first copy ends: step back over joiners / correction words
+            while a > i and (norm[a - 1] in _JOINERS or norm[a - 1] in _CORRECTIONS
+                             or (norm[a - 1] == "i" and a < j and norm[a] == "mean")):
+                a -= 1
+            first_len, gap = a - i, j - a
+            if first_len < min_words or gap > 4:
+                continue
+            k = 0
+            while j + k < n and norm[i + k] == norm[j + k] and norm[i + k]:
+                k += 1
+            if k < min_words:
+                continue
+            if any(t[-1:] in ".?!" for t in toks[i:a - 1]):
+                continue  # a whole earlier sentence, not a false start
+            corrected = any(norm[x] in _CORRECTIONS for x in range(a, j))
+            if corrected and k < first_len and toks[a - 1][-1:] in ".?!":
+                continue  # "...budget. Actually we need..." adds to a finished sentence
+            if k >= first_len or corrected:
+                if sum(bool(_NUMBERY.match(w)) for w in norm[i:a]) * 2 >= first_len:
+                    continue  # digits / phone numbers are often said twice on purpose
+                cut = j
+                break
+        if cut is not None:
+            i = cut  # drop the false start and the words that joined it to the restart
+        else:
+            out.append(toks[i])
+            i += 1
+    return " ".join(out)
+
+
+def clean_dictation(text: str, rules, cleanup: bool, restarts: bool = False,
+                    restart_min_words: int = 3) -> str:
     text = text.strip()
     if cleanup:
         text = _FILLER.sub("", text)
         text = _REPEAT.sub(r"\1", text)
+        if restarts:
+            text = remove_restarts(text, restart_min_words)
     text = apply_replacements(text, rules)
     if cleanup:
         text = re.sub(r"^[\s,.;:]+", "", text).strip()
@@ -2769,7 +2830,9 @@ class App:
             result = self.engine.transcribe(self.engine.main, audio=audio,
                                             sample_rate=SAMPLE_RATE, timestamps="none")
             raw = str(result.get("text", ""))
-            text = clean_dictation(raw, self.rules, self.cfg["cleanup"])
+            text = clean_dictation(raw, self.rules, self.cfg["cleanup"],
+                                   bool(self.cfg["remove_restarts"]),
+                                   int(self.cfg["restart_min_words"]))
             log.info("dictation: %.1fs audio transcribed in %.2fs (%d chars)",
                      elapsed, time.monotonic() - t, len(text))
             if self.cfg["debug"]:

@@ -159,6 +159,13 @@ You can also point PyKeet at a model server you run yourself:
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
+**False starts.** With `remove_restarts = true` (default) a dictation like "I might start a
+sentence and actually I might start a sentence" becomes "I might start a sentence". It is plain
+rules, not an AI model: it fires only when at least `restart_min_words` (3) words at the start of
+a phrase are repeated, either as a full repeat or after a correction word (actually, sorry,
+I mean, no wait). Numbers said twice and repeated whole sentences you finished are left alone,
+but it can occasionally cut something you repeated on purpose. It never touches call transcripts.
+
 ## Call transcripts
 
 `YYYY-MM-DD_HHMM_call.md`, with blank Contact / Project / speaker-name lines to fill in by hand.
