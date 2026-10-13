@@ -159,6 +159,13 @@ You can also point PyKeet at a model server you run yourself:
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
+**False starts.** With `remove_restarts = true` (default) a dictation like "I might start a
+sentence and actually I might start a sentence" becomes "I might start a sentence". It is plain
+rules, not an AI model: it fires only when at least `restart_min_words` (3) words at the start of
+a phrase are repeated, either as a full repeat or after a correction word (actually, sorry,
+I mean, no wait). Numbers said twice and repeated whole sentences you finished are left alone,
+but it can occasionally cut something you repeated on purpose. It never touches call transcripts.
+
 ## Call transcripts
 
 `YYYY-MM-DD_HHMM_call.md`, with blank Contact / Project / speaker-name lines to fill in by hand.
@@ -219,17 +226,36 @@ Set `wayland_portals = true` in `config.toml` and `pip install jeepney`. Then:
 ## Proofreading: have the text read back to you
 
 Select text in any app (email draft, dictation result) and press **Ctrl+Alt+P**. A window opens
-and reads it aloud one short phrase at a time, highlighting the phrase being spoken. When
-something sounds wrong press **Space**: the word you just heard is flagged red (press Space
-again on it to unflag; PyKeet allows `proofread_reaction_seconds` for your reaction time).
-**P** pauses, **Left/Right** go back/skip. Finish with a copy button (it also closes the window).
+and reads it aloud one short phrase at a time, highlighting the phrase being spoken.
 
 **Long dictations are read back first.** When a dictation is 3+ sentences (`review_min_sentences`)
-it is not pasted straight away. A window opens and starts reading it to you at once; press
-**Space** when a word sounds wrong. Four buttons: **Rewind to start** (and play), **Pause/Resume**,
-**Copy with [CHECK] marks and close** and **Copy plain and close** (Esc does the same as plain).
-Copying also closes the window, and **you can't start another dictation until it is closed**.
-On Wayland, press Ctrl+V afterwards. Turn off with `review_long_dictation = false`.
+it is not pasted straight away. The same window opens and starts reading it at once. No new
+dictation can start until you close it. (`review_when_changed = true` also opens it for a short
+dictation when the cleanup replaced or removed words. `review_long_dictation = false` turns the
+window off.)
+
+**Flagging mistakes.** **Tap Space** to flag the word you just heard. Or **hold Space**: the audio
+stops and the highlight walks backwards word by word; let go to flag the word it stopped on and
+hear it again from there. **P** pauses, **Left/Right** go back/skip, or use the buttons.
+
+**Seeing what the cleanup changed.** Words that were replaced (e.g. "sun form" to "SunForm"), and
+the spot where a false start was cut, show in amber with a dotted underline. Hover over one to see
+what Parakeet originally heard, and click **Restore** to put it back. (Capitals, punctuation and
+um/uh removal are not marked.)
+
+**Fixing text and teaching PyKeet.** **Edit text** lets you correct words in place (reading pauses,
+then reads your version). Your fix shows as a change too. **Right-click** a changed word and choose
+**Always replace this in future dictation** to remember it: e.g. "damp proofing coarse" becomes
+"damp proof course" from then on. It is saved in `corrections.json` (not in your hand-edited
+`config.toml`; lines in `config.toml` win if both exist). `python main.py --corrections` lists what
+was learned and `python main.py --forget "phrase"` removes one. This fixes the text after Parakeet
+has heard it; it does not retrain Parakeet, so it only helps when Parakeet makes the same mistake
+each time.
+
+**Finishing.** **Copy with highlights and close** puts rich text on the clipboard with flagged
+words highlighted (it pastes straight into an email), plus a plain-text fallback. **Copy plain and
+close** (or Esc) copies the clean text. Copying also closes the window. On Wayland, press Ctrl+V
+afterwards.
 
 **Voices** (`tts_engine = "auto"` tries Kokoro then Piper; install at least one; models download on first use into
 `tts-models/`):

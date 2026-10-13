@@ -3,3 +3,4 @@ pykeet.log*
 tmp/
 tts-models/
 .portal-restore-token
+corrections.json

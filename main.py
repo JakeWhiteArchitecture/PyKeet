@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "2.0"
+VERSION = "2.2"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -98,6 +98,11 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
+# Also delete false starts, e.g. "I might start a sentence and actually I might start a
+# sentence" -> "I might start a sentence". Plain rules (no AI), dictation only, never calls.
+# It can wrongly cut something you repeated on purpose; set false to switch it off.
+remove_restarts = true
+restart_min_words = 3     # how many words in a row must repeat (higher = more careful)
 # "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
 # On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
 # it falls back to "clipboard" automatically and shows a notification. See README.
@@ -196,9 +201,12 @@ proofread_reaction_seconds = 0.5
 # When a dictation is this many sentences or longer, show it in a window first instead of
 # pasting straight away. It reads the text back to you at once (SPACE flags a word you think
 # is wrong). "Copy plain and close" (or Esc) pastes it; the other button pastes it with
-# [CHECK] marks at your flags. No new dictation can start until the window is closed.
+# highlighted flags (rich text, ready to paste into an email). No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
+# Also open the window for a short dictation when the cleanup replaced or removed words
+# (not for capitals, punctuation or um/uh), so you can see what changed and restore it.
+review_when_changed = false
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it. (Not used on
@@ -235,6 +243,7 @@ DEFAULTS = {
     "piper_noise_w": 0.9,
     "review_long_dictation": True,
     "review_min_sentences": 3,
+    "review_when_changed": False,
     "proofread_phrase_words": 14,
     "proofread_reaction_seconds": 0.5,
     "wayland_portals": False,
@@ -261,6 +270,8 @@ DEFAULTS = {
     "call_device": "",
     "input_device": "",
     "cleanup": True,
+    "remove_restarts": True,
+    "restart_min_words": 3,
     "insert_method": "paste",
     "use_pynput_on_wayland": False,
     "dictation_beep": False,
@@ -353,11 +364,137 @@ def apply_replacements(text: str, rules) -> str:
     return text
 
 
-def clean_dictation(text: str, rules, cleanup: bool) -> str:
+_JOINERS = {"and", "but", "so", "or", "well", "then"}      # glue between a false start and the restart
+_CORRECTIONS = {"actually", "sorry", "rather", "wait", "no", "mean"}   # "actually", "I mean", "no wait"
+_NUMBERY = re.compile(r"^(?:\d+|oh|zero|nought|one|two|three|four|five|six|seven|eight|nine|ten|"
+                      r"double|triple)$")
+
+
+def remove_restarts(text: str, min_words: int = 3) -> str:
+    """Drop a false start: "I might start a sentence and actually I might start a sentence"
+    becomes "I might start a sentence". Fires only when the start of a phrase is repeated
+    within a few words (min_words or more words in a row), either as a full repeat or after a
+    correction word (actually / sorry / I mean / no wait). Plain rules, no AI model."""
+    toks = text.split()
+    n = len(toks)
+    if n < 2 * min_words:
+        return text
+    norm = [re.sub(r"[^\w']", "", t.lower()) for t in toks]
+    out: list[str] = []
+    i = 0
+    while i < n:
+        cut = None
+        for j in range(i + min_words, min(n, i + 40)):
+            a = j  # where the first copy ends: step back over joiners / correction words
+            while a > i and (norm[a - 1] in _JOINERS or norm[a - 1] in _CORRECTIONS
+                             or (norm[a - 1] == "i" and a < j and norm[a] == "mean")):
+                a -= 1
+            first_len, gap = a - i, j - a
+            if first_len < min_words or gap > 4:
+                continue
+            k = 0
+            while j + k < n and norm[i + k] == norm[j + k] and norm[i + k]:
+                k += 1
+            if k < min_words:
+                continue
+            if any(t[-1:] in ".?!" for t in toks[i:a - 1]):
+                continue  # a whole earlier sentence, not a false start
+            corrected = any(norm[x] in _CORRECTIONS for x in range(a, j))
+            if corrected and k < first_len and toks[a - 1][-1:] in ".?!":
+                continue  # "...budget. Actually we need..." adds to a finished sentence
+            if k >= first_len or corrected:
+                if sum(bool(_NUMBERY.match(w)) for w in norm[i:a]) * 2 >= first_len:
+                    continue  # digits / phone numbers are often said twice on purpose
+                cut = j
+                break
+        if cut is not None:
+            i = cut  # drop the false start and the words that joined it to the restart
+        else:
+            out.append(toks[i])
+            i += 1
+    return " ".join(out)
+
+
+_FILLER_WORDS = {"um", "umm", "uh", "uhh", "er", "erm", "ah", "ahh"}
+
+
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^\w']", "", w.lower())
+
+
+def compute_changes(raw: str, final: str) -> list[dict]:
+    """Where `final` differs from `raw` in WORDS (capitals, punctuation and um/uh removal are
+    not counted). Each change: start/end = character span in `final` (start == end for a
+    removal, at the word that now follows), original = the raw words, kind = changed/removed/
+    added. Used to colour what the cleanup or your own edits changed."""
+    import difflib
+
+    rt = raw.split()
+    fm = list(re.finditer(r"\S+", final))
+    ft = [m.group(0) for m in fm]
+    ri = [i for i, w in enumerate(rt) if _norm_word(w)]
+    fi = [i for i, w in enumerate(ft) if _norm_word(w)]
+    rn = [_norm_word(rt[i]) for i in ri]
+    fn = [_norm_word(ft[i]) for i in fi]
+    out: list[dict] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, rn, fn, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        orig_words = rt[ri[i1]:ri[i2 - 1] + 1] if i2 > i1 else []
+        if tag == "delete" and all(_norm_word(w) in _FILLER_WORDS for w in orig_words):
+            continue
+        if j2 > j1:
+            start, end = fm[fi[j1]].start(), fm[fi[j2 - 1]].end()
+        else:
+            start = end = fm[fi[j1]].start() if j1 < len(fi) else len(final.rstrip())
+        out.append({"start": start, "end": end, "original": " ".join(orig_words),
+                    "kind": "removed" if j2 == j1 else ("added" if i2 == i1 else "changed")})
+    return out
+
+
+CORRECTIONS_PATH = HERE / "corrections.json"
+
+
+def load_corrections() -> dict:
+    try:
+        data = json.loads(CORRECTIONS_PATH.read_text(encoding="utf-8"))
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_correction(wrong: str, right: str) -> None:
+    table = load_corrections()
+    table[wrong.strip()] = right.strip()
+    CORRECTIONS_PATH.write_text(json.dumps(table, indent=2, ensure_ascii=False, sort_keys=True),
+                                encoding="utf-8")
+
+
+def forget_correction(wrong: str) -> bool:
+    table = load_corrections()
+    key = next((k for k in table if k.lower() == wrong.strip().lower()), None)
+    if key is None:
+        return False
+    del table[key]
+    CORRECTIONS_PATH.write_text(json.dumps(table, indent=2, ensure_ascii=False, sort_keys=True),
+                                encoding="utf-8")
+    return True
+
+
+def all_replacements(cfg: dict) -> dict:
+    """Corrections you taught PyKeet (corrections.json), then config.toml's [replacements]
+    on top (so a line in config.toml wins)."""
+    return {**load_corrections(), **(cfg.get("replacements") or {})}
+
+
+def clean_dictation(text: str, rules, cleanup: bool, restarts: bool = False,
+                    restart_min_words: int = 3) -> str:
     text = text.strip()
     if cleanup:
         text = _FILLER.sub("", text)
         text = _REPEAT.sub(r"\1", text)
+        if restarts:
+            text = remove_restarts(text, restart_min_words)
     text = apply_replacements(text, rules)
     if cleanup:
         text = re.sub(r"^[\s,.;:]+", "", text).strip()
@@ -2255,6 +2392,9 @@ class ProofSession:
         self.next = 0
         self.flags: set[tuple[int, int]] = set()   # (start, end) character spans
         self.words: dict[int, list] = {}           # phrase -> [(a, b, t0, t1)] when known
+        self.word_list = [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+        self.hold = False                          # Space held: rewinding, audio silent
+        self.skip_to = None                        # start playing from this character
         self.note = ""                             # e.g. "Downloading voice…"
         self.paused = False
         self.finished = False
@@ -2311,30 +2451,60 @@ class ProofSession:
             except OSError:
                 pass
 
+    def _heard_locked(self):
+        """(a, b) of the word you most likely just reacted to (the phrase if no timings), or
+        None. Call with the lock held."""
+        i = self.cur
+        if i < 0:
+            return None
+        elapsed = time.monotonic() - self._started_at
+        t = elapsed - self.reaction_s
+        words = self.words.get(i)
+        if words:
+            if t < 0 and i > 0 and self.words.get(i - 1):
+                prev = self.words[i - 1]
+                return (prev[-1][0], prev[-1][1])
+            if t < 0:
+                return (words[0][0], words[0][1])
+            hit = next((w for w in words if w[2] <= t < w[3]), words[-1])
+            return (hit[0], hit[1])
+        if elapsed < self.reaction_s and i > 0:
+            i -= 1
+        return self.spans[i]
+
     def flag(self) -> None:
         """Flag the word you just heard (or the phrase, if word timings are unknown)."""
         with self._lock:
-            i = self.cur
-            if i < 0:
+            span = self._heard_locked()
+            if span is None:
                 return
-            elapsed = time.monotonic() - self._started_at
-            t = elapsed - self.reaction_s
-            words = self.words.get(i)
-            span = None
-            if words:
-                if t < 0 and i > 0 and self.words.get(i - 1):
-                    prev = self.words[i - 1]
-                    span = (prev[-1][0], prev[-1][1])
-                elif t < 0:
-                    span = (words[0][0], words[0][1])
-                else:
-                    hit = next((w for w in words if w[2] <= t < w[3]), words[-1])
-                    span = (hit[0], hit[1])
-            else:
-                if elapsed < self.reaction_s and i > 0:
-                    i -= 1
-                span = self.spans[i]
             self.flags.symmetric_difference_update({span})
+        self.on_change()
+
+    def rewind_begin(self):
+        """Space went down: silence the audio and return the word you reacted to."""
+        with self._lock:
+            span = self._heard_locked()
+            if span is None:
+                return None
+            self.hold = True
+            self._go.clear()
+        self._kill()
+        return span
+
+    def resume_from(self, pos: int) -> None:
+        """Play again starting at the word that begins at character pos."""
+        with self._lock:
+            idx = next((k for k, (x, y) in enumerate(self.spans) if x <= pos < y),
+                       min(self.next, len(self.spans) - 1))
+            self.next, self.skip_to = idx, pos
+            self.hold = False
+            self.paused = False
+            self.finished = False
+            self._go.set()
+        self._kill()
+        if not self.thread.is_alive() and not self._stop:
+            self.start()
         self.on_change()
 
     def toggle_pause(self) -> None:
@@ -2386,13 +2556,21 @@ class ProofSession:
             return "Nothing flagged."
         return "\n".join(f"- {self._context(a, b)}" for a, b in sorted(self.flags))
 
-    def marked_text(self, marker: str = "[CHECK] ") -> str:
+    def html(self, colour: str = "#ffe14d") -> str:
+        """The text as HTML with each flagged word highlighted (for pasting into an email)."""
+        import html as _html
+
         out, last = [], 0
-        for a, _b in sorted(self.flags):
-            out += [self.text[last:a], marker]
-            last = a
-        out.append(self.text[last:])
-        return "".join(out)
+        for a, b in sorted(self.flags):
+            if a < last:
+                continue
+            out.append(_html.escape(self.text[last:a]))
+            out.append(f'<span style="background-color:{colour};">'
+                       f'{_html.escape(self.text[a:b])}</span>')
+            last = b
+        out.append(_html.escape(self.text[last:]))
+        paras = [p.replace("\n", "<br>") for p in re.split(r"\n\s*\n", "".join(out))]
+        return "<html><body>" + "".join(f"<p>{p}</p>" for p in paras if p.strip()) + "</body></html>"
 
 
 def count_sentences(text: str) -> int:
@@ -2411,7 +2589,7 @@ THEME = {"bg": "#0b0e2a", "card": "#1a1a2e", "border": "#4a1d96", "text": "#f2f2
 class App:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.rules = compile_replacements(cfg.get("replacements") or {})
+        self.rules = compile_replacements(all_replacements(cfg))
         self.engine = Engine(cfg)
         self.recorder = Recorder(cfg["input_device"])
         self.widget = None   # ui_qt.QtWidget, created in main()
@@ -2694,6 +2872,12 @@ class App:
             log.info("dictation: transcription cancelled (result will be dropped)")
             self.ui("hidden")
 
+    def add_correction(self, wrong: str, right: str) -> None:
+        """Remember a fix you made (from the read-back window) for all future dictation."""
+        save_correction(wrong, right)
+        self.rules = compile_replacements(all_replacements(self.cfg))
+        log.info("learned correction: %r -> %r", wrong, right)
+
     def review_reminder(self) -> None:
         self.notify("PyKeet", "Finish with the read-back window first: copy and close it.")
 
@@ -2761,7 +2945,9 @@ class App:
             result = self.engine.transcribe(self.engine.main, audio=audio,
                                             sample_rate=SAMPLE_RATE, timestamps="none")
             raw = str(result.get("text", ""))
-            text = clean_dictation(raw, self.rules, self.cfg["cleanup"])
+            text = clean_dictation(raw, self.rules, self.cfg["cleanup"],
+                                   bool(self.cfg["remove_restarts"]),
+                                   int(self.cfg["restart_min_words"]))
             log.info("dictation: %.1fs audio transcribed in %.2fs (%d chars)",
                      elapsed, time.monotonic() - t, len(text))
             if self.cfg["debug"]:
@@ -2773,12 +2959,14 @@ class App:
                 self.ui("nospeech")
                 return
             self.last_text = text
+            changed = bool(self.cfg["review_when_changed"]) and bool(compute_changes(raw, text))
             if (self.cfg["review_long_dictation"] and self.widget
-                    and count_sentences(text) >= int(self.cfg["review_min_sentences"])):
-                # long: show it first (Enter = read back, Esc = paste); the window pastes it
+                    and (count_sentences(text) >= int(self.cfg["review_min_sentences"])
+                         or changed)):
+                # long (or edited): show it first; the window pastes/copies when you close it
                 self.review_open = True
                 self.widget.q.put(("proof", text, lambda t: self.post(
-                    lambda: self._finish_review(t))))
+                    lambda: self._finish_review(t)), raw))
             else:
                 insert_text(text, self.cfg["insert_method"], self.notify)
             self.ui("done")
@@ -2788,9 +2976,14 @@ class App:
         finally:
             self._set_idle()
 
-    def _finish_review(self, text: str) -> None:
+    def _finish_review(self, text) -> None:
+        """The read-back window closed. text=None means it already put rich text (HTML with the
+        flagged words highlighted) on the clipboard, so there is nothing to type in."""
         self.review_open = False
-        self._insert(text)
+        if text is None:
+            self.notify("PyKeet", "Copied with highlights - press Ctrl+V to paste")
+        else:
+            self._insert(text)
 
     def _insert(self, text: str) -> None:
         try:
@@ -3241,6 +3434,17 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--evaluate":
         evaluate()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--corrections":
+        table = load_corrections()
+        for wrong, right in sorted(table.items()):
+            print(f"{wrong}  ->  {right}")
+        print(f"({len(table)} learned in {CORRECTIONS_PATH.name}; remove one with: "
+              f"python main.py --forget \"phrase\")")
+        return
+    if len(sys.argv) > 2 and sys.argv[1] == "--forget":
+        phrase = " ".join(sys.argv[2:])
+        print("Forgotten." if forget_correction(phrase) else f"No learned correction for {phrase!r}.")
         return
     cmd = sys.argv[1][2:] if len(sys.argv) > 1 and sys.argv[1].startswith("--") else ""
     if cmd in REMOTE_COMMANDS:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import signal
 import sys
 import threading
@@ -364,8 +365,8 @@ class QtWidget:
         win.raise_()
         win.activateWindow()
 
-    def open_proof(self, text, review_cb=None) -> None:
-        win = ProofWindow(self, text, review_cb)
+    def open_proof(self, text, review_cb=None, raw=None) -> None:
+        win = ProofWindow(self, text, review_cb, raw)
         self.keep(win)
         win.show()
         win.raise_()
@@ -556,26 +557,75 @@ class ViewerWindow(QtWidgets.QWidget):
 # Read-back window
 # --------------------------------------------------------------------------
 
-class ProofWindow(QtWidgets.QWidget):
-    """Reads the text aloud from the start; SPACE flags the word being spoken. Two buttons
-    copy and close in one step (with [CHECK] marks, or plain). For a dictation (review_cb)
-    the chosen text is handed back to be pasted and dictation stays blocked until closed."""
+CHANGE_COLOUR = "#ffb020"
+COMMON_WORDS = {"a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "i",
+                "in", "is", "it", "of", "on", "or", "so", "that", "the", "to", "was", "we",
+                "with", "you"}
 
-    def __init__(self, ui: QtWidget, text: str, review_cb=None):
+
+class ChangeBubble(QtWidgets.QFrame):
+    """Small box next to a changed word: shows what was there before, with a Restore button."""
+
+    def __init__(self, parent, on_restore, on_enter, on_leave):
+        super().__init__(parent)
+        t = theme()
+        self.setObjectName("bubble")
+        self.setStyleSheet(f"QFrame#bubble {{ background:{t['card']}; border:1px solid "
+                           f"{t['cyan']}; border-radius:10px; }} QLabel {{ background:"
+                           f"transparent; }}")
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(12, 6, 6, 6)
+        self.label = QtWidgets.QLabel()
+        self.label.setWordWrap(True)
+        self.label.setMinimumWidth(200)
+        self.label.setMaximumWidth(380)
+        lay.addWidget(self.label)
+        self.btn = QtWidgets.QPushButton("Restore")
+        self.btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn.clicked.connect(on_restore)
+        lay.addWidget(self.btn)
+        self._enter, self._leave = on_enter, on_leave
+        self.hide()
+
+    def enterEvent(self, e) -> None:
+        self._enter()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e) -> None:
+        self._leave()
+        super().leaveEvent(e)
+
+
+class ProofWindow(QtWidgets.QWidget):
+    """Reads the text aloud from the start.
+      SPACE: tap = flag the word you just heard; HOLD = rewind word by word, release to flag
+             that word and play again from it.
+      Edit text: fix words in place (reading pauses; it reads your version afterwards).
+      Changed words show in colour; hover for the original, Restore to put it back;
+      right-click to teach PyKeet the correction for future dictation.
+      Two buttons copy and close in one step (highlighted rich text, or plain). For a dictation
+      (review_cb) the plain text is handed back to be pasted and dictation stays blocked until
+      the window is closed."""
+
+    def __init__(self, ui: QtWidget, text: str, review_cb=None, raw: str | None = None):
         super().__init__()
-        self.ui, self.text, self.review_cb = ui, text, review_cb
+        self.ui, self.review_cb = ui, review_cb
+        self.text = text
+        self.raw = raw if raw is not None else text
         self.cfg = ui.app.cfg
         self.done = False
+        self.edit_mode = False
+        self.rw = None            # rewind state while Space is held
+        self.hover = None         # index into self.changes shown in the bubble
         self.events: queue.Queue = queue.Queue()
         self.tts_state: dict = {"tried": False, "cache": None, "fails": 0}
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("PyKeet - read back" if review_cb else "PyKeet proofreading")
-        self.resize(780, 560)
+        self.resize(820, 600)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        self.sess = M.ProofSession(text, self.speak, lambda **kw: self.events.put(kw),
-                                   int(self.cfg["proofread_phrase_words"]),
-                                   float(self.cfg["proofread_reaction_seconds"]))
+        self.changes = M.compute_changes(self.raw, self.text)
+        self.sess = self.make_session(text, set(), 0, paused=False)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(14, 14, 14, 12)
         self.status = QtWidgets.QLabel("Starting…")
@@ -586,6 +636,11 @@ class ProofWindow(QtWidgets.QWidget):
         self.edit.setReadOnly(True)
         self.edit.setPlainText(text)
         self.edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.edit.setMouseTracking(True)
+        self.edit.viewport().setMouseTracking(True)
+        self.edit.viewport().installEventFilter(self)
+        self.edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.edit.customContextMenuRequested.connect(self.show_menu)
         f = self.edit.font()
         f.setPointSize(14)
         self.edit.setFont(f)
@@ -593,22 +648,33 @@ class ProofWindow(QtWidgets.QWidget):
 
         bar = QtWidgets.QHBoxLayout()
         self.rewind = QtWidgets.QPushButton("Rewind to start")
-        self.rewind.clicked.connect(self.sess.restart)
+        self.rewind.clicked.connect(lambda: self.sess.restart())
         self.pause = QtWidgets.QPushButton("Pause")
-        self.pause.clicked.connect(self.sess.toggle_pause)
-        marked = QtWidgets.QPushButton("Copy with [CHECK] marks and close")
+        self.pause.clicked.connect(lambda: self.sess.toggle_pause())
+        self.edit_btn = QtWidgets.QPushButton("Edit text")
+        self.edit_btn.clicked.connect(self.toggle_edit)
+        marked = QtWidgets.QPushButton("Copy with highlights and close")
         marked.clicked.connect(lambda: self.finish(True))
         plain = QtWidgets.QPushButton("Copy plain and close")
         plain.clicked.connect(lambda: self.finish(False))
-        for b in (self.rewind, self.pause, marked, plain):
+        for b in (self.rewind, self.pause, self.edit_btn, marked, plain):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         bar.addWidget(self.rewind)
         bar.addWidget(self.pause)
+        bar.addWidget(self.edit_btn)
         bar.addStretch(1)
         bar.addWidget(marked)
         bar.addWidget(plain)
         lay.addLayout(bar)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self, activated=self.commit_edit)
 
+        self.bubble = ChangeBubble(self, self.restore_hovered, lambda: self.hide_timer.stop(),
+                                   lambda: self.hide_timer.start(350))
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.bubble.hide)
+        self.rw_timer = QTimer(self)
+        self.rw_timer.timeout.connect(self.rewind_step)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.pump)
         self.timer.start(120)
@@ -616,6 +682,20 @@ class ProofWindow(QtWidgets.QWidget):
             self.sess.start()
         else:
             QTimer.singleShot(0, lambda: self.finish(False))
+
+    # -- sessions ------------------------------------------------------------------------
+    def make_session(self, text: str, flags: set, pos: int, paused: bool):
+        sess = M.ProofSession(text, self.speak, lambda **kw: self.events.put(kw),
+                              int(self.cfg["proofread_phrase_words"]),
+                              float(self.cfg["proofread_reaction_seconds"]))
+        sess.flags = set(flags)
+        if paused and sess.spans:
+            idx = next((k for k, (x, y) in enumerate(sess.spans) if x <= pos < y),
+                       min(len(sess.spans) - 1, 0))
+            sess.paused = True
+            sess._go.clear()
+            sess.cur = sess.next = idx
+        return sess
 
     # -- speech (runs in the session thread) ---------------------------------------------
     def speak(self, phrase: str, sess) -> None:
@@ -653,11 +733,19 @@ class ProofWindow(QtWidgets.QWidget):
             return  # skip this phrase, carry on
         if me + 1 < len(sess.spans):
             cache.prefetch(sess.phrase(me + 1))
-        if sess.next != me + 1 or sess._stop:
-            return  # skipped or paused while this was being prepared
+        if sess.next != me + 1 or sess._stop or sess.hold:
+            return  # skipped, paused or rewinding while this was being prepared
+        words = tts.word_spans(phrase, sess.spans[me][0], len(samples) / sr)
+        skip = sess.skip_to
+        if skip is not None:  # start from a word (after a rewind), a little early
+            sess.skip_to = None
+            first = next((k for k, w in enumerate(words) if w[0] >= skip), 0)
+            t0 = max(0.0, words[first][2] - 0.12)
+            samples = samples[int(t0 * sr):]
+            words = [(a, b, max(0.0, ts - t0), te - t0) for a, b, ts, te in words[first:]]
         pb = tts.Playback(samples, sr)
         sess.proc = pb
-        sess.set_words(me, tts.word_spans(phrase, sess.spans[me][0], pb.duration))
+        sess.set_words(me, words)
         log.info("proofread: phrase %d/%d (%.1fs)", me + 1, len(sess.spans), pb.duration)
         pb.start()
         sess.began_playing()
@@ -673,6 +761,26 @@ class ProofWindow(QtWidgets.QWidget):
             pass
         self.refresh(err)
 
+    def word_at(self, pos: int):
+        for a, b in self.sess.word_list:
+            if a <= pos <= b:
+                return (a, b)
+        return None
+
+    def anchors(self):
+        """(char span, change) pairs: where each change is drawn (a removal is drawn on the
+        word that now follows it)."""
+        out = []
+        for c in self.changes:
+            if c["end"] > c["start"]:
+                out.append(((c["start"], c["end"]), c))
+            else:
+                w = self.word_at(c["start"]) or (self.sess.word_list[-1]
+                                                 if self.sess.word_list else None)
+                if w:
+                    out.append((w, c))
+        return out
+
     def _selection(self, a: int, b: int, fmt: QtGui.QTextCharFormat):
         sel = QtWidgets.QTextEdit.ExtraSelection()
         cur = QtGui.QTextCursor(self.edit.document())
@@ -686,26 +794,51 @@ class ProofWindow(QtWidgets.QWidget):
         t = theme()
         sess = self.sess
         sels = []
+        chg = QtGui.QTextCharFormat()
+        chg.setForeground(QtGui.QColor(CHANGE_COLOUR))
+        chg.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.DotLine)
+        chg.setUnderlineColor(QtGui.QColor(CHANGE_COLOUR))
         now = QtGui.QTextCharFormat()
         now.setBackground(QtGui.QColor(t["purple"]))
         flag = QtGui.QTextCharFormat()
         flag.setBackground(QtGui.QColor(t["pink"]))
         flag.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.SingleUnderline)
-        if 0 <= sess.cur < len(sess.spans) and not sess.finished:
+        playing = 0 <= sess.cur < len(sess.spans) and not sess.finished
+        if playing and self.rw is None and not self.edit_mode:
             a, b = sess.spans[sess.cur]
             sels.append(self._selection(a, b, now))
+        for (a, b), _c in self.anchors():  # after the reading highlight, so the colour shows
+            sels.append(self._selection(a, b, chg))
         for a, b in sess.flags:
             sels.append(self._selection(a, b, flag))
+        if self.rw is not None:
+            cur = QtGui.QTextCharFormat()
+            cur.setBackground(QtGui.QColor(t["cyan"]))
+            cur.setForeground(QtGui.QColor(t["bg"]))
+            a, b = sess.word_list[self.rw["idx"]]
+            sels.append(self._selection(a, b, cur))
         self.edit.setExtraSelections(sels)
-        if 0 <= sess.cur < len(sess.spans) and not sess.finished:
-            cur = QtGui.QTextCursor(self.edit.document())
-            cur.setPosition(sess.spans[sess.cur][0])
-            self.edit.setTextCursor(cur)
-            self.edit.ensureCursorVisible()
+        if not self.edit_mode:
+            focus = None
+            if self.rw is not None:
+                focus = sess.word_list[self.rw["idx"]][0]
+            elif playing:
+                focus = sess.spans[sess.cur][0]
+            if focus is not None:
+                c = QtGui.QTextCursor(self.edit.document())
+                c.setPosition(focus)
+                self.edit.setTextCursor(c)
+                self.edit.ensureCursorVisible()
         self.pause.setText("Resume" if sess.paused else "Pause")
         n = len(sess.flags)
         if error:
             self.status.setText(error)
+        elif self.edit_mode:
+            self.status.setText("Editing: change the text, then press Done editing "
+                                "(Ctrl+Enter). Reading is paused.")
+        elif self.rw is not None:
+            self.status.setText("Rewinding… let go of SPACE to flag the highlighted word and "
+                                "play again from it")
         elif sess.note:
             self.status.setText(sess.note)
         elif sess.finished:
@@ -713,41 +846,188 @@ class ProofWindow(QtWidgets.QWidget):
                                 f"(Esc = copy plain and close).")
         else:
             state = "Paused" if sess.paused else "Reading"
-            self.status.setText(f"{state} {sess.cur + 1}/{len(sess.spans)} · {n} flagged · "
-                                f"SPACE = flag the word you just heard · P = pause · "
-                                f"Esc = copy plain and close")
+            extra = f" · {len(self.changes)} changed (hover them)" if self.changes else ""
+            self.status.setText(f"{state} {sess.cur + 1}/{len(sess.spans)} · {n} flagged"
+                                f"{extra} · tap SPACE to flag, HOLD it to rewind · P = pause")
 
-    # -- finishing: copy and close in one go ---------------------------------------------------
-    def finish(self, marked: bool) -> None:
-        if self.done:
+    # -- hover bubble, restore, right-click ---------------------------------------------------
+    def eventFilter(self, obj, ev) -> bool:
+        if obj is self.edit.viewport() and not self.edit_mode:
+            if ev.type() == QtCore.QEvent.Type.MouseMove:
+                self.on_hover(ev.position().toPoint())
+            elif ev.type() == QtCore.QEvent.Type.Leave:
+                self.hide_timer.start(350)
+        return False
+
+    def change_at(self, pos: int):
+        for (a, b), c in self.anchors():
+            if a <= pos <= b:
+                return c
+        return None
+
+    def on_hover(self, pt) -> None:
+        pos = self.edit.cursorForPosition(pt).position()
+        c = self.change_at(pos)
+        if c is None:
+            if self.bubble.isVisible():
+                self.hide_timer.start(350)
             return
-        self.done = True
-        out = self.sess.marked_text() if marked else self.text
-        self.sess.stop()
-        self.timer.stop()
-        if not self.review_cb:
-            QtGui.QGuiApplication.clipboard().setText(out)
-        cb = self.review_cb
-        self.close()
-        if cb:  # give focus back to the app you were in, then paste
-            QTimer.singleShot(300, lambda: cb(out))
+        self.hide_timer.stop()
+        if self.hover is c and self.bubble.isVisible():
+            return
+        self.hover = c
+        what = {"removed": "Removed", "added": "Added", "changed": "Heard"}[c["kind"]]
+        self.bubble.label.setText(f"{what}: “{c['original']}”" if c["original"]
+                                  else "Added by the cleanup")
+        self.bubble.btn.setText("Restore")
+        anchor = next((ab for ab, cc in self.anchors() if cc is c), None)
+        cur = QtGui.QTextCursor(self.edit.document())
+        cur.setPosition(anchor[0] if anchor else pos)
+        rect = self.edit.cursorRect(cur)
+        p = self.edit.viewport().mapTo(self, rect.bottomLeft())
+        self.bubble.adjustSize()
+        self.bubble.move(min(p.x(), max(0, self.width() - self.bubble.width() - 12)), p.y() + 4)
+        self.bubble.show()
+        self.bubble.raise_()
 
-    def closeEvent(self, e) -> None:
-        if not self.done:  # closed with the window's own X: same as "copy plain and close"
-            self.done = True
-            self.sess.stop()
-            self.timer.stop()
-            if self.review_cb:
-                cb, out = self.review_cb, self.text
-                QTimer.singleShot(300, lambda: cb(out))
+    def restore_hovered(self) -> None:
+        if self.hover is not None:
+            self.restore_change(self.hover)
+        self.bubble.hide()
+
+    def restore_change(self, c: dict) -> None:
+        t = self.text
+        if c["kind"] == "removed":
+            pos = c["start"]
+            if pos < len(t.rstrip()):
+                new = t[:pos] + c["original"] + " " + t[pos:]
             else:
-                QtGui.QGuiApplication.clipboard().setText(self.text)
-        super().closeEvent(e)
+                new = t[:pos] + " " + c["original"] + t[pos:]
+        else:
+            new = re.sub(r"  +", " ", t[:c["start"]] + c["original"] + t[c["end"]:])
+        self.apply_text(new)
 
+    def show_menu(self, pt) -> None:
+        if self.edit_mode:
+            return
+        c = self.change_at(self.edit.cursorForPosition(pt).position())
+        if c is None:
+            return
+        menu = QtWidgets.QMenu(self.edit)
+        restore = menu.addAction("Restore original")
+        remember = None
+        if c["kind"] == "changed" and c["original"]:
+            remember = menu.addAction("Always replace this in future dictation…")
+        chosen = menu.exec(self.edit.viewport().mapToGlobal(pt))
+        if chosen is restore:
+            self.restore_change(c)
+        elif remember is not None and chosen is remember:
+            self.remember(c)
+
+    def remember(self, c: dict) -> None:
+        def clean(s: str) -> str:
+            return s.strip().strip(",.;:!?\"'").strip()
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Remember this correction")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(QtWidgets.QLabel("When PyKeet hears:"))
+        wrong = QtWidgets.QLineEdit(clean(c["original"]))
+        lay.addWidget(wrong)
+        lay.addWidget(QtWidgets.QLabel("write:"))
+        right = QtWidgets.QLineEdit(clean(self.text[c["start"]:c["end"]]))
+        lay.addWidget(right)
+        warn = QtWidgets.QLabel("")
+        warn.setObjectName("muted")
+        warn.setWordWrap(True)
+        lay.addWidget(warn)
+
+        def check():
+            w = wrong.text().strip().lower()
+            warn.setText("Careful: that is a very common word, so it would be replaced "
+                         "everywhere. Add a neighbouring word to be safe."
+                         if w in COMMON_WORDS or len(w) < 3 else "")
+
+        wrong.textChanged.connect(check)
+        check()
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(dlg.reject)
+        ok = QtWidgets.QPushButton("Remember")
+        ok.clicked.connect(dlg.accept)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        if dlg.exec() and wrong.text().strip() and right.text().strip():
+            self.ui.app.add_correction(wrong.text(), right.text())
+            self.status.setText(f"Remembered: “{wrong.text().strip()}” → "
+                                f"“{right.text().strip()}” (used from your next dictation; "
+                                f"see python main.py --corrections)")
+
+    # -- editing -----------------------------------------------------------------------------
+    def toggle_edit(self) -> None:
+        if self.edit_mode:
+            self.commit_edit()
+            return
+        self.edit_mode = True
+        if not self.sess.paused:
+            self.sess.toggle_pause()
+        self.bubble.hide()
+        self.edit.setReadOnly(False)
+        self.edit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.edit.setFocus()
+        self.edit_btn.setText("Done editing")
+
+    def commit_edit(self) -> None:
+        if not self.edit_mode:
+            return
+        self.edit_mode = False
+        new = self.edit.toPlainText()
+        self.edit.setReadOnly(True)
+        self.edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFocus()
+        self.edit_btn.setText("Edit text")
+        self.apply_text(new)
+
+    def apply_text(self, new: str) -> None:
+        """Make `new` the text: keep flags that were outside the edited stretch, re-split the
+        phrases, recompute what differs from what was heard, and wait (paused) at the edit."""
+        old = self.text
+        if new == old:
+            self.refresh()
+            return
+        p = 0
+        while p < min(len(old), len(new)) and old[p] == new[p]:
+            p += 1
+        sfx = 0
+        while sfx < min(len(old), len(new)) - p and old[-1 - sfx] == new[-1 - sfx]:
+            sfx += 1
+        delta = len(new) - len(old)
+        flags = set()
+        for a, b in self.sess.flags:
+            if b <= p:
+                flags.add((a, b))
+            elif a >= len(old) - sfx:
+                flags.add((a + delta, b + delta))
+        self.sess.stop()
+        self.text = new
+        self.edit.setPlainText(new)
+        self.changes = M.compute_changes(self.raw, new)
+        self.sess = self.make_session(new, flags, p, paused=True)
+        if self.sess.spans:
+            self.sess.start()
+        self.hover = None
+        self.refresh()
+
+    # -- keys: tap = flag, hold = rewind ------------------------------------------------------
     def keyPressEvent(self, e) -> None:
         k = e.key()
+        if self.edit_mode:
+            return super().keyPressEvent(e)
         if k == Qt.Key.Key_Space:
-            self.sess.flag()
+            if not e.isAutoRepeat():
+                self.begin_hold()
         elif k == Qt.Key.Key_P:
             self.sess.toggle_pause()
         elif k == Qt.Key.Key_Left:
@@ -758,3 +1038,88 @@ class ProofWindow(QtWidgets.QWidget):
             self.finish(False)
         else:
             super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e) -> None:
+        if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat() and self.rw is not None:
+            self.end_hold()
+        else:
+            super().keyReleaseEvent(e)
+
+    def focusOutEvent(self, e) -> None:
+        if self.rw is not None:
+            self.end_hold()
+        super().focusOutEvent(e)
+
+    def begin_hold(self) -> None:
+        if self.rw is not None or not self.sess.spans:
+            return
+        span = self.sess.rewind_begin()
+        if span is None:
+            return
+        words = self.sess.word_list
+        idx = max((k for k, (a, _b) in enumerate(words) if a <= span[0]), default=0)
+        self.rw = {"idx": idx, "steps": 0, "span": span}
+        self.rw_timer.start(260)
+        self.refresh()
+
+    def rewind_step(self) -> None:
+        if self.rw is None:
+            return
+        self.rw["idx"] = max(0, self.rw["idx"] - 1)
+        self.rw["steps"] += 1
+        if self.rw["steps"] == 8:
+            self.rw_timer.setInterval(140)  # speed up when held a long time
+        self.refresh()
+
+    def end_hold(self) -> None:
+        rw, self.rw = self.rw, None
+        self.rw_timer.stop()
+        if rw is None:
+            return
+        if rw["steps"] == 0:  # a tap: flag (or unflag) the word you just heard
+            span = rw["span"]
+            self.sess.flags.symmetric_difference_update({span})
+        else:
+            span = self.sess.word_list[rw["idx"]]
+            self.sess.flags.add(span)
+        self.sess.resume_from(span[0])
+        self.refresh()
+
+    # -- finishing: copy and close in one go ---------------------------------------------------
+    def finish(self, marked: bool) -> None:
+        if self.done:
+            return
+        self.commit_edit()
+        self.done = True
+        self.sess.stop()
+        for tm in (self.timer, self.rw_timer, self.hide_timer):
+            tm.stop()
+        clip = QtGui.QGuiApplication.clipboard()
+        cb = self.review_cb
+        if marked:  # rich text: flagged words highlighted, plain text as the fallback
+            mime = QtCore.QMimeData()
+            mime.setHtml(self.sess.html())
+            mime.setText(self.text)
+            clip.setMimeData(mime)
+            out = None  # already on the clipboard; nothing to type in
+        else:
+            out = self.text
+            if not cb:
+                clip.setText(out)
+        self.close()
+        if cb:  # give focus back to the app you were in, then paste
+            QTimer.singleShot(300, lambda: cb(out))
+
+    def closeEvent(self, e) -> None:
+        if not self.done:  # closed with the window's own X: same as "copy plain and close"
+            self.commit_edit()
+            self.done = True
+            self.sess.stop()
+            for tm in (self.timer, self.rw_timer, self.hide_timer):
+                tm.stop()
+            if self.review_cb:
+                cb, out = self.review_cb, self.text
+                QTimer.singleShot(300, lambda: cb(out))
+            else:
+                QtGui.QGuiApplication.clipboard().setText(self.text)
+        super().closeEvent(e)

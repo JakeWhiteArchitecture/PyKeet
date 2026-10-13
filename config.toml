@@ -43,6 +43,11 @@ input_device = ""
 
 # --- Dictation -------------------------------------------------------------
 cleanup = true            # strip um/uh, collapse repeats, apply replacements
+# Also delete false starts, e.g. "I might start a sentence and actually I might start a
+# sentence" -> "I might start a sentence". Plain rules (no AI), dictation only, never calls.
+# It can wrongly cut something you repeated on purpose; set false to switch it off.
+remove_restarts = true
+restart_min_words = 3     # how many words in a row must repeat (higher = more careful)
 # "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
 # On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
 # it falls back to "clipboard" automatically and shows a notification. See README.
@@ -141,9 +146,12 @@ proofread_reaction_seconds = 0.5
 # When a dictation is this many sentences or longer, show it in a window first instead of
 # pasting straight away. It reads the text back to you at once (SPACE flags a word you think
 # is wrong). "Copy plain and close" (or Esc) pastes it; the other button pastes it with
-# [CHECK] marks at your flags. No new dictation can start until the window is closed.
+# highlighted flags (rich text, ready to paste into an email). No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
+# Also open the window for a short dictation when the cleanup replaced or removed words
+# (not for capitals, punctuation or um/uh), so you can see what changed and restore it.
+review_when_changed = false
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it. (Not used on
