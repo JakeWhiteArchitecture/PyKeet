@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "2.3"
+VERSION = "2.4"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -103,6 +103,14 @@ cleanup = true            # strip um/uh, collapse repeats, apply replacements
 # It can wrongly cut something you repeated on purpose; set false to switch it off.
 remove_restarts = true
 restart_min_words = 3     # how many words in a row must repeat (higher = more careful)
+# Optional: also ask a small language model to catch false starts the rules miss.
+#   "none" = off.  "llm" = LiquidAI LFM2.5-350M (needs `pip install transformers`; ~700 MB
+#   downloads on first use; adds roughly a second or two per dictation on a CPU - untested).
+# Cautious by design: only deleted repeats and punctuation/capitals are accepted from the model;
+# any changed or added word is ignored. Dictations shorter than cleanup_min_words are skipped.
+cleanup_backend = "none"
+cleanup_model = "LiquidAI/LFM2.5-350M"
+cleanup_min_words = 8
 # "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
 # On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
 # it falls back to "clipboard" automatically and shows a notification. See README.
@@ -272,6 +280,9 @@ DEFAULTS = {
     "cleanup": True,
     "remove_restarts": True,
     "restart_min_words": 3,
+    "cleanup_backend": "none",
+    "cleanup_model": "LiquidAI/LFM2.5-350M",
+    "cleanup_min_words": 8,
     "insert_method": "paste",
     "use_pynput_on_wayland": False,
     "dictation_beep": False,
@@ -450,6 +461,68 @@ def compute_changes(raw: str, final: str) -> list[dict]:
         out.append({"start": start, "end": end, "original": " ".join(orig_words),
                     "kind": "removed" if j2 == j1 else ("added" if i2 == i1 else "changed")})
     return out
+
+
+def merge_cleanup(original: str, suggestion: str, min_words: int = 2):
+    """Take a small model's rewrite of `original` but only believe the safe parts.
+    Accepted: punctuation and capital letters on words that stayed, and deleting words that are a
+    repeat of the words right next to them (a false start). Everything else the model did
+    (changed, added or other deleted words) is ignored and the original words are kept.
+    Returns (text, accepted, rejected)."""
+    import difflib
+
+    ot, mt = original.split(), suggestion.split()
+    oi = [i for i, w in enumerate(ot) if _norm_word(w)]
+    mi = [i for i, w in enumerate(mt) if _norm_word(w)]
+    on = [_norm_word(ot[i]) for i in oi]
+    mn = [_norm_word(mt[i]) for i in mi]
+    glue = _JOINERS | _CORRECTIONS | {"i", "mean"}
+    out: list[str] = []
+    accepted = rejected = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, on, mn, autojunk=False).get_opcodes():
+        if tag == "equal":
+            out += [mt[mi[j]] for j in range(j1, j2)]  # the model's punctuation / capitals
+            continue
+        keep = [ot[oi[i]] for i in range(i1, i2)]
+        if tag == "delete":
+            def alike(x, y):  # near-identical word lists (a restart may swap one word)
+                return bool(x) and difflib.SequenceMatcher(None, x, y, autojunk=False).ratio() >= 0.7
+
+            def is_false_start(a: int, b: int) -> bool:
+                core = on[a:b]
+                while core and core[0] in glue:
+                    core = core[1:]
+                while core and core[-1] in glue:
+                    core = core[:-1]
+                n = len(core)
+                before = on[:a]
+                while before and before[-1] in glue:
+                    before = before[:-1]
+                after = on[b:]
+                while after and after[0] in glue:
+                    after = after[1:]
+                return n >= min_words and (alike(core, before[-n:]) or alike(core, after[:n]))
+
+            # the diff may line the deletion up a few words off; any shift that leaves the
+            # same text behind is the same edit, so try them all
+            width, ok = i2 - i1, False
+            for sh in range(-width, width + 1):
+                a, b = i1 + sh, i2 + sh
+                if a < 0 or b > len(on):
+                    continue
+                if sh > 0 and on[i1:i1 + sh] != on[i2:i2 + sh]:
+                    continue
+                if sh < 0 and on[a:i1] != on[b:i2]:
+                    continue
+                if is_false_start(a, b):
+                    ok = True
+                    break
+            if ok:
+                accepted += 1
+                continue
+        rejected += 1
+        out += keep
+    return " ".join(out), accepted, rejected
 
 
 CORRECTIONS_PATH = HERE / "corrections.json"
@@ -2865,6 +2938,29 @@ class App:
         if self.cfg["dictation_mode"] == "push":
             self.stop_dictation()
 
+    def _llm_cleanup(self, text: str) -> str:
+        """Optional small-model pass (cleanup_backend = "llm"); only safe edits are kept."""
+        if self.cfg["cleanup_backend"] != "llm" or len(text.split()) < int(
+                self.cfg["cleanup_min_words"]):
+            return text
+        try:
+            import llm_cleanup
+
+            cleaner = llm_cleanup.get_cleaner(str(self.cfg["cleanup_model"]))
+            if cleaner is None:
+                return text
+            t = time.monotonic()
+            suggestion = cleaner.generate(text.strip())
+            merged, ok, bad = merge_cleanup(text.strip(), suggestion)
+            log.info("cleanup model: %d change(s) accepted, %d ignored, %.1fs", ok, bad,
+                     time.monotonic() - t)
+            if self.cfg["debug"]:
+                log.debug("cleanup model said %r", suggestion)
+            return merged + " " if merged else text
+        except Exception:
+            log.exception("cleanup model failed; using the rules-only text")
+            return text
+
     def cancel_transcription(self) -> None:
         """The pill's X while transcribing. The model finishes its work, but nothing is pasted."""
         if self.mode == "dictation" and self.phase == "processing":
@@ -2950,6 +3046,7 @@ class App:
                                    int(self.cfg["restart_min_words"]))
             log.info("dictation: %.1fs audio transcribed in %.2fs (%d chars)",
                      elapsed, time.monotonic() - t, len(text))
+            text = self._llm_cleanup(text)
             if self.cfg["debug"]:
                 log.debug("dictation text: %r", text)
             if self._cancel_tx:
@@ -3444,6 +3541,14 @@ def main() -> None:
         raw = " ".join(sys.argv[2:])
         out = clean_dictation(raw, compile_replacements(all_replacements(cfg)), True,
                               bool(cfg["remove_restarts"]), int(cfg["restart_min_words"])).strip()
+        if cfg["cleanup_backend"] == "llm":
+            import llm_cleanup
+
+            cleaner = llm_cleanup.get_cleaner(str(cfg["cleanup_model"]))
+            if cleaner:
+                suggestion = cleaner.generate(out)
+                out, ok, bad = merge_cleanup(out, suggestion)
+                print(f"Model said: {suggestion}\n(accepted {ok} change(s), ignored {bad})")
         print("Heard:   ", raw)
         print("Cleaned: ", out)
         for c in compute_changes(raw, out):

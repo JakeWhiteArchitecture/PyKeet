@@ -166,6 +166,15 @@ a phrase are repeated, either as a full repeat or after a correction word (actua
 I mean, no wait). Numbers said twice and repeated whole sentences you finished are left alone,
 but it can occasionally cut something you repeated on purpose. It never touches call transcripts.
 
+**Optional small-model pass (LFM2.5-350M).** `cleanup_backend = "llm"` also asks LiquidAI's
+LFM2.5-350M (about 700 MB, downloads on first use, `pip install transformers` recent enough for
+LFM2) to catch false starts where the second attempt uses slightly different words. It is cautious:
+the model's answer is only trusted for deleting a repeated phrase and for punctuation/capitals; any
+word it changes or adds is ignored and your original word is kept. Dictations under
+`cleanup_min_words` (8) skip it. Try it without speaking: `python main.py --clean "your sentence"`
+(it prints what the model said and how many changes were accepted or ignored). Untested on a real
+model so far: check the speed and quality on your own dictation before relying on it.
+
 ## Call transcripts
 
 `YYYY-MM-DD_HHMM_call.md`, with blank Contact / Project / speaker-name lines to fill in by hand.

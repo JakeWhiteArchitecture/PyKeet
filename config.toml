@@ -48,6 +48,14 @@ cleanup = true            # strip um/uh, collapse repeats, apply replacements
 # It can wrongly cut something you repeated on purpose; set false to switch it off.
 remove_restarts = true
 restart_min_words = 3     # how many words in a row must repeat (higher = more careful)
+# Optional: also ask a small language model to catch false starts the rules miss.
+#   "none" = off.  "llm" = LiquidAI LFM2.5-350M (needs `pip install transformers`; ~700 MB
+#   downloads on first use; adds roughly a second or two per dictation on a CPU - untested).
+# Cautious by design: only deleted repeats and punctuation/capitals are accepted from the model;
+# any changed or added word is ignored. Dictations shorter than cleanup_min_words are skipped.
+cleanup_backend = "none"
+cleanup_model = "LiquidAI/LFM2.5-350M"
+cleanup_min_words = 8
 # "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
 # On Wayland (Fedora 43 GNOME) PyKeet cannot press keys for you unless ydotool is set up, so
 # it falls back to "clipboard" automatically and shows a notification. See README.
