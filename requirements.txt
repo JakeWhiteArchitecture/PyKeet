@@ -9,3 +9,5 @@ pynput
 pyperclip
 # Window toolkit (Qt 6): the pill, transcript viewer and read-back window
 PySide6-Essentials
+# Small language model for the dictation cleanup pass (LFM2.5-350M; recent version needed)
+transformers>=4.55

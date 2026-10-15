@@ -51,11 +51,12 @@ cleanup = true            # strip um/uh, collapse repeats, apply replacements
 remove_restarts = true
 restart_min_words = 3     # how many words in a row must repeat (higher = more careful)
 # Optional: also ask a small language model to catch false starts the rules miss.
-#   "none" = off.  "llm" = LiquidAI LFM2.5-350M (needs `pip install transformers`; ~700 MB
-#   downloads on first use; adds roughly a second or two per dictation on a CPU - untested).
+#   "llm" = LiquidAI LFM2.5-350M (the default; needs `transformers`, installed by
+#   requirements.txt; ~700 MB downloads on first use, then loads in the background at start-up).
+#   "none" = off (the plain rules still run). Adds roughly a second or two per dictation (untested).
 # Cautious by design: only deleted repeats and punctuation/capitals are accepted from the model;
 # any changed or added word is ignored. Dictations shorter than cleanup_min_words are skipped.
-cleanup_backend = "none"
+cleanup_backend = "llm"
 cleanup_model = "LiquidAI/LFM2.5-350M"
 cleanup_min_words = 8
 # "paste" (clipboard + Ctrl+V), "type", or "clipboard" (just copy; you press Ctrl+V yourself).
@@ -98,36 +99,6 @@ use_ner = true
 # "en_core_web_md" (~40 MB, better) or "en_core_web_sm" (~12 MB, faster). Whichever you
 # install; the other is the fallback.
 ner_model = "en_core_web_md"
-
-# --- Transcript viewer: decisions and tasks ---------------------------------
-# Underline sentences about decisions to make, options, decisions made, tasks to do and tasks
-# done, and offer an "Action summary" view. The built-in phrase rules are a rough guide only
-# (English). Optionally add an AI helper with action_backend, which decides how it is asked:
-highlight_actions = true
-#   "zeroshot"       small classifier model, needs `pip install transformers`; set action_model, e.g.
-#                    "MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33" (tiny) or
-#                    "typeform/distilbert-base-uncased-mnli" (bigger). Empty action_model = rules only.
-#   "llm"            small chat model run here, e.g. action_model = "Qwen/Qwen2.5-0.5B-Instruct"
-#                    (~1 GB, minutes on a long call) or "Qwen/Qwen2.5-1.5B-Instruct" (~3 GB).
-#                    Models under ~0.5B (e.g. Gemma 3 270M) are usually too small to be reliable.
-#   "server"         a model you run in your own local server with the common OpenAI-style API
-#                    (llama.cpp's llama-server, Ollama, LM Studio, bitnet.cpp for ternary BitNet
-#                    models). Set action_server. PyKeet installs nothing for this.
-#   "needle"         Cactus Needle 3, a tiny (8-29 MB) tool-calling model on the CPU:
-#                    `pip install cactus-needle`. First use downloads the model and a small engine
-#                    library from Hugging Face. PyKeet switches off its anonymous usage pings.
-#   "phrases"        compare each sentence with the example phrases in action_phrases.toml using
-#                    word overlap. No install; improve it by adding your own phrases.
-#   "needle-phrases" the same phrase bank compared by MEANING with Needle 3's embeddings, so
-#                    different wording still matches (`pip install cactus-needle`).
-# Test any of them with:  python main.py --explain "a sentence"   (one sentence)
-#                         python main.py --evaluate               (50 labelled sentences, scores)
-action_backend = "zeroshot"
-action_model = ""
-action_server = "http://127.0.0.1:8080"
-# How alike a sentence must be to a phrase to count for the two "phrases" backends
-# (0 = automatic: 0.35 for "phrases", 0.55 for "needle-phrases"). Raise it for fewer false hits.
-phrase_min_similarity = 0
 
 # --- Proofreading (read text aloud, flag what sounds wrong) -------------------
 # Select text anywhere and press proofread_shortcut (on Wayland: select it, or copy it with

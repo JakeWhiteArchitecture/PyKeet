@@ -13,7 +13,6 @@ import queue
 import re
 import signal
 import sys
-import threading
 import time
 from collections import deque
 
@@ -446,16 +445,6 @@ class ViewerWindow(QtWidgets.QWidget):
                 row.addWidget(lab)
             row.addStretch(1)
             lay.addLayout(row)
-            if ui.app.cfg.get("highlight_actions"):
-                row2 = QtWidgets.QHBoxLayout()
-                row2.addWidget(self._muted("Underlined:"))
-                for kind, colour in M.ACTION_COLOURS.items():
-                    lab = QtWidgets.QLabel(M.ACTION_LABELS[kind])
-                    lab.setStyleSheet(f"color:{colour}; text-decoration: underline; "
-                                      f"padding:2px 6px; font-weight:bold;")
-                    row2.addWidget(lab)
-                row2.addStretch(1)
-                lay.addLayout(row2)
 
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("status")
@@ -468,12 +457,9 @@ class ViewerWindow(QtWidgets.QWidget):
         self.copy_btn.clicked.connect(self.copy_all)
         bar.addWidget(self.copy_btn)
         self.raw_btn = QtWidgets.QPushButton("Show raw Markdown")
-        self.sum_btn = QtWidgets.QPushButton("Action summary")
         self.raw_btn.clicked.connect(lambda: self.set_mode("raw"))
-        self.sum_btn.clicked.connect(lambda: self.set_mode("summary"))
         if markdown:
             bar.addWidget(self.raw_btn)
-            bar.addWidget(self.sum_btn)
         if path:
             b = QtWidgets.QPushButton("Open file")
             b.clicked.connect(lambda: M.open_path(path))
@@ -486,7 +472,6 @@ class ViewerWindow(QtWidgets.QWidget):
         lay.addLayout(bar)
 
         self.render()
-        self.start_analysis()
 
     def _muted(self, text: str) -> QtWidgets.QLabel:
         lab = QtWidgets.QLabel(text)
@@ -511,9 +496,6 @@ class ViewerWindow(QtWidgets.QWidget):
             elif tag in M.ENTITY_COLOURS:
                 f.setBackground(QtGui.QColor(M.ENTITY_COLOURS[tag]))
                 f.setForeground(QtGui.QColor("#111111"))
-            elif tag in M.ACTION_COLOURS:
-                f.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.SingleUnderline)
-                f.setUnderlineColor(QtGui.QColor(M.ACTION_COLOURS[tag]))
         return f
 
     def render(self) -> None:
@@ -523,69 +505,19 @@ class ViewerWindow(QtWidgets.QWidget):
             self.edit.setPlainText(self.body)
             return
         cur = self.edit.textCursor()
-        if self.mode == "summary":
-            segs = M.md_segments(M.action_summary(self.body), highlight=False)
-        else:
-            segs = M.md_segments(self.body, cfg.get("highlight_names") or (),
-                                 cfg.get("highlight_companies") or (),
-                                 ner=bool(cfg.get("use_ner")),
-                                 actions=bool(cfg.get("highlight_actions")))
+        segs = M.md_segments(self.body, cfg.get("highlight_names") or (),
+                             cfg.get("highlight_companies") or (), ner=bool(cfg.get("use_ner")))
         for chunk, tags in segs:
             cur.insertText(chunk, self.fmt(tags))
         self.edit.moveCursor(QtGui.QTextCursor.MoveOperation.Start)
 
     def copy_all(self) -> None:
-        text = M.action_summary(self.body) if self.mode == "summary" else self.body
-        QtGui.QGuiApplication.clipboard().setText(text)
+        QtGui.QGuiApplication.clipboard().setText(self.body)
 
     def set_mode(self, mode: str) -> None:
         self.mode = "formatted" if self.mode == mode else mode
         self.raw_btn.setText("Show formatted" if self.mode == "raw" else "Show raw Markdown")
-        self.sum_btn.setText("Show formatted" if self.mode == "summary" else "Action summary")
         self.render()
-
-    # -- AI decision/task analysis in the background -------------------------------------
-    def start_analysis(self) -> None:
-        cfg = self.ui.app.cfg
-        model_name = str(cfg.get("action_model") or "")
-        backend = str(cfg.get("action_backend") or "zeroshot")
-        if not (self.markdown and cfg.get("highlight_actions")
-                and (model_name or backend in ("server", "needle", "phrases", "needle-phrases"))):
-            return
-        self.status.setText("Analysing decisions and tasks with the AI model "
-                            "(the first time it downloads the model)…")
-        self.status.show()
-        self.results: queue.Queue = queue.Queue()
-
-        def work():
-            try:
-                model = M.get_action_model(model_name, backend,
-                                           str(cfg.get("action_server") or ""),
-                                           float(cfg.get("phrase_min_similarity") or 0))
-                if model is None:
-                    raise RuntimeError("model could not be loaded; see pykeet.log")
-                M.analyse_actions(self.body, model)
-                self.results.put(None)
-            except Exception as exc:
-                log.exception("action analysis failed")
-                self.results.put(exc)
-
-        self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self._poll_analysis)
-        self.poll_timer.start(300)
-        threading.Thread(target=work, daemon=True).start()
-
-    def _poll_analysis(self) -> None:
-        try:
-            res = self.results.get_nowait()
-        except queue.Empty:
-            return
-        self.poll_timer.stop()
-        if res is None:
-            self.status.setText("AI analysis done.")
-            self.render()
-        else:
-            self.status.setText(f"AI model unavailable ({res}); showing the phrase rules.")
 
 
 # --------------------------------------------------------------------------

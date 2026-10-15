@@ -122,40 +122,6 @@ file can't be read, a window shows the exact reason.
   `pip install spacy` then `python -m spacy download en_core_web_md` (use `en_core_web_sm` for the
   12 MB version). PyKeet uses it automatically (`use_ner = true`) and falls back to the simple rules if
   it is missing. It is still a statistical guess and will occasionally mislabel something.
-- **Decisions and tasks.** The viewer underlines sentences about a decision to make (amber), options
-  (magenta), a decision made (green), a task to do (blue) and a task done (grey), and "Action summary"
-  lists them all by type with their timestamps. By default this uses simple phrase rules (English):
-  good on clear wording ("we've decided to go with larch", "I'll send the drawings"), poor on natural
-  speech ("so yeah we'll go larch"). For better results set `action_model` in `config.toml` to a small
-  zero-shot AI model, e.g. `MoritzLaurer/xtremedistil-l6-h256-zeroshot-v1.1-all-33` (needs
-  `pip install transformers`; downloads once; runs in the background after the viewer opens, with the
-  rules shown straight away). A small chat language model can be used instead: `action_backend = "llm"` with
-  `action_model = "Qwen/Qwen2.5-0.5B-Instruct"` (about 1 GB; understands wording better than the
-  classifier but takes minutes on a long call; `Qwen2.5-1.5B-Instruct` is better and slower; models
-  under ~0.5B such as Gemma 3 270M are usually too small to be reliable). It is shown worked examples
-  and picks an answer letter for each sentence. **Needle 3** (Cactus Compute, Apache-2.0) is the lightest option: a tiny 8-29 MB tool-calling model
-  that runs on the CPU and installs with almost nothing (`pip install cactus-needle`). Set
-  `action_backend = "needle"`. Each label becomes a "tool" and the model picks one per sentence (or
-  none). Good to know: the first use downloads the model and a small native engine library from
-  Hugging Face (after that it works offline), and the package would send anonymous usage pings by
-  default, which PyKeet switches off (`NEEDLE_TELEMETRY=0`). It is built for phone-style tool calls, so
-  test it on a real transcript before trusting it.
-**Teach it with example phrases.** `action_backend = "phrases"` compares each sentence with the example
-  phrases in `action_phrases.toml` (created on first use with about a dozen per type plus a "none" group of
-  ordinary chat; edit it freely and add phrases from your own meetings). With no install it matches by
-  word overlap: on my 50-sentence check it lifted messy speech from 4/14 to 8/14 when combined with the
-  rules, with one more false hit, so it is a modest help. `action_backend = "needle-phrases"` compares the
-  same phrases by *meaning* using Needle 3's embeddings (so "we'll go larch" can match "let's go with
-  that"); that one is untested on real speech. See why a sentence got its label with To compare backends or models on your own machine, set `action_backend` /
-  `action_model` and run `python main.py --evaluate`: it scores the rules, the model alone and the two
-  combined on 50 labelled sentences, shows the time per sentence and lists what is still wrong.
-  `python main.py --explain "so yeah I think we'll go larch"`.
-You can also point PyKeet at a model server you run yourself:
-  `action_backend = "server"` and `action_server = "http://127.0.0.1:8080"` (llama.cpp's
-  `llama-server`, Ollama, LM Studio, or Microsoft's `bitnet.cpp` server for ternary BitNet models
-  such as BitNet b1.58 2B4T, which is about 0.4 GB and fast on a CPU but needs its own build, see its
-  README). PyKeet sends each sentence with the worked examples and reads the one-letter answer.
-  Treat both as a guide, not minutes: always check against the transcript.
 - **One copy at a time.** Starting a second PyKeet is refused with a message. Two copies both react
   to every shortcut (two dialogs, two pastes). To stop an old copy: `pkill -f main.py`.
 
@@ -166,7 +132,7 @@ a phrase are repeated, either as a full repeat or after a correction word (actua
 I mean, no wait). Numbers said twice and repeated whole sentences you finished are left alone,
 but it can occasionally cut something you repeated on purpose. It never touches call transcripts.
 
-**Optional small-model pass (LFM2.5-350M).** `cleanup_backend = "llm"` also asks LiquidAI's
+**Small-model pass (LFM2.5-350M, on by default).** `cleanup_backend = "llm"` also asks LiquidAI's
 LFM2.5-350M (about 700 MB, downloads on first use, `pip install transformers` recent enough for
 LFM2) to catch false starts where the second attempt uses slightly different words. It is cautious:
 the model's answer is only trusted for deleting a repeated phrase and for punctuation/capitals; any
@@ -207,10 +173,11 @@ for you. PyKeet works around it (**written without access to a Wayland machine, 
 3. Inserting text: PyKeet cannot press Ctrl+V for you, so it **copies the text and shows a
    notification - press Ctrl+V**. For automatic typing, install `ydotool`, run its daemon, and
    give yourself write access to `/dev/uinput` (udev rule); PyKeet then uses it automatically.
-4. Mic, file picker and notifications work as before. **Wayland windows cannot choose their
-   position or stay above other windows** (a Wayland rule, not a PyKeet one), so the floating pill
-   appears wherever GNOME puts it and may sit behind the app you're in. If it steals keyboard focus
-   from the app you dictate into, set `show_pill = false`; notifications still tell you the state.
+4. Mic, file picker and notifications work as before. **Native Wayland windows cannot choose their
+   position or stay above other windows**, so by default PyKeet runs its windows through XWayland
+   (`qt_platform = "auto"`, needs `sudo dnf install xcb-util-cursor`), which puts the pill at the
+   bottom centre and keeps it on top. If the pill ever steals keyboard focus from the app you
+   dictate into, set `show_pill = false`; notifications still tell you the state.
 
 **Python on Fedora 43:** the system Python becomes 3.14, and your `.venv` (built on 3.13) will
 probably break. Rebuild it:
@@ -238,16 +205,20 @@ Select text in any app (email draft, dictation result) and press **Ctrl+Alt+P**.
 and reads it aloud one short phrase at a time, highlighting the phrase being spoken.
 
 **Long dictations are read back first.** When a dictation is 3+ sentences (`review_min_sentences`)
-it is not pasted straight away. The same window opens and starts reading it at once. No new
-dictation can start until you close it. (`review_when_changed = true` also opens it for a short
+or 30+ words (`review_min_words`) it is not pasted straight away. A window opens instead. No new
+dictation can start until you close it. The window has two views:
+- **Cleanup** shows what the cleanup changed, hover/restore/right-click as described below. It opens
+  in this view when something was changed (`review_start_view = "auto"`).
+- **Proofread** reads the text aloud and lets you flag errors.
+If GNOME opens the window behind your other windows, PyKeet sends a notification. (`review_when_changed = true` also opens it for a short
 dictation when the cleanup replaced or removed words. `review_long_dictation = false` turns the
 window off.)
 
-**Flagging mistakes.** **Tap Space** to flag the word you just heard. Or **hold Space**: the audio
+**Flagging mistakes (Proofread view).** **Tap Space** to flag the word you just heard. Or **hold Space**: the audio
 stops and the highlight walks backwards word by word; let go to flag the word it stopped on and
 hear it again from there. **P** pauses, **Left/Right** go back/skip, or use the buttons.
 
-**Seeing what the cleanup changed.** Words that were replaced (e.g. "sun form" to "SunForm"), and
+**Seeing what the cleanup changed (Cleanup view).** Words that were replaced (e.g. "sun form" to "SunForm"), and
 the spot where a false start was cut, show in amber with a dotted underline. Hover over one to see
 what Parakeet originally heard, and click **Restore** to put it back. (Capitals, punctuation and
 um/uh removal are not marked.)
@@ -299,13 +270,15 @@ a word either side. Piper's download and voices were not tested here; Kokoro was
 - **Hotkey consumption:** only on Windows does PyKeet swallow `Ctrl+Space` so the focused app never
   sees it. On Linux/macOS pynput cannot do that, so the app also receives the keys (a warning is
   logged). If that clashes (VS Code autocomplete, input-language switching), change `dictation_shortcut`.
-- **Linux Wayland:** pynput hotkeys and key injection do not work. Use an X11 session. (Wayland would need
-  `evdev` for hotkeys and `ydotool`/`wtype` for typing.)
+- **Linux Wayland:** global hotkeys and key typing need the GNOME shortcuts / portals described in the
+  Wayland section above.
 - **macOS:** grant Accessibility and Microphone permission to the terminal/Python. Widget focus behaviour
   on macOS is untested.
 - **Windows:** elevated (admin) apps ignore simulated keys from a non-elevated script.
 - **Clipboard restore** handles text only; if you had an image on the clipboard it is not put back.
-- **Pill position and always-on-top** work on X11/Windows/macOS but not on Wayland (see above).
+- **Pill position and always-on-top** work on X11, Windows and macOS, and on Wayland because PyKeet
+  runs its windows through XWayland by default (`qt_platform = "auto"`; needs `xcb-util-cursor`).
+  With `qt_platform = "wayland"` GNOME decides where windows go and nothing stays on top.
 - **Licences:** Parakeet weights are CC-BY-4.0, `diarize` is Apache 2.0. Check the moondream / Photon
   engine licence separately before publishing this as open source.
 - Logs go to `pykeet.log` (rotating). Transcript text is only logged when `debug = true`.
