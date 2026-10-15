@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "2.4"
+VERSION = "2.5"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -58,7 +58,9 @@ CONFIG_TEMPLATE = '''\
 # --- Shortcuts -------------------------------------------------------------
 dictation_shortcut = "ctrl+space"
 recall_shortcut = "f8"
-cancel_shortcut = "esc"
+# Empty = no global cancel key. (Esc used to be global on X11, which cancelled by accident;
+# cancel a recording with the X on the pill, or right-click the pill.)
+cancel_shortcut = ""
 call_shortcut = "ctrl+alt+r"
 # Opens the audio file picker (mp3/ogg/flac/wav)
 import_shortcut = "ctrl+alt+o"
@@ -208,13 +210,19 @@ proofread_reaction_seconds = 0.5
 
 # When a dictation is this many sentences or longer, show it in a window first instead of
 # pasting straight away. It reads the text back to you at once (SPACE flags a word you think
-# is wrong). "Copy plain and close" (or Esc) pastes it; the other button pastes it with
+# is wrong). "Copy plain and close" pastes it; the other button pastes it with
 # highlighted flags (rich text, ready to paste into an email). No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
 # Also open the window for a short dictation when the cleanup replaced or removed words
 # (not for capitals, punctuation or um/uh), so you can see what changed and restore it.
 review_when_changed = false
+
+# --- Windows (Qt) -----------------------------------------------------------
+# "auto" = on Wayland run through XWayland, so the floating pill can be placed (bottom centre)
+# and kept on top; Wayland itself forbids both. "wayland" = native Wayland (the desktop places
+# windows, nothing stays on top). "xcb" = always XWayland/X11. Needs xcb-util-cursor on Fedora.
+qt_platform = "auto"
 
 # --- Misc ------------------------------------------------------------------
 # [x, y] of the floating widget; empty = bottom centre. Updated when you drag it. (Not used on
@@ -236,7 +244,7 @@ debug = false             # true = transcript text is allowed in the log
 DEFAULTS = {
     "dictation_shortcut": "ctrl+space",
     "recall_shortcut": "f8",
-    "cancel_shortcut": "esc",
+    "cancel_shortcut": "",
     "call_shortcut": "ctrl+alt+r",
     "import_shortcut": "ctrl+alt+o",
     "proofread_shortcut": "ctrl+alt+p",
@@ -293,6 +301,7 @@ DEFAULTS = {
     "expected_speakers": 2,
     "widget_position": [],
     "show_pill": True,
+    "qt_platform": "auto",
     "debug": False,
     "replacements": {},
 }
@@ -2222,7 +2231,7 @@ class Hotkeys:
         cfg = app.cfg
         self.dictation = parse_shortcut(cfg["dictation_shortcut"])
         self.recall = parse_shortcut(cfg["recall_shortcut"])
-        self.cancel = parse_shortcut(cfg["cancel_shortcut"])
+        self.cancel = parse_shortcut(cfg["cancel_shortcut"]) if cfg["cancel_shortcut"] else None
         self.call = parse_shortcut(cfg["call_shortcut"])
         self.importer = parse_shortcut(cfg["import_shortcut"])
         self.proofread = parse_shortcut(cfg["proofread_shortcut"])
@@ -2271,9 +2280,10 @@ class Hotkeys:
         if name == main and mods <= others:
             self.app.post(self.app.recall)
             return
-        mods, main = self.cancel
-        if name == main and mods <= others:
-            self.app.post(self.app.cancel_dictation)
+        if self.cancel:
+            mods, main = self.cancel
+            if name == main and mods <= others:
+                self.app.post(self.app.cancel_dictation)
 
     def release(self, name: str) -> None:
         if name not in self.down:

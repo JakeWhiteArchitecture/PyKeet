@@ -53,7 +53,7 @@ the first time, then fully offline); the floating pill and a notification say wh
 | --- | --- |
 | `Ctrl+Space` | Press once to start recording, press again to stop, transcribe and insert (presses under 0.3 s are ignored). Set `dictation_mode = "push"` in `config.toml` if you prefer hold-to-talk. |
 | `F8` | Re-insert the last dictation |
-| `Esc` while recording | Discard |
+| X on the pill, or right-click it, while recording | Discard |
 | `Ctrl+Alt+R` | Start / stop call recording |
 | `Ctrl+Alt+O` | Open the audio file picker  |
 
@@ -202,8 +202,8 @@ for you. PyKeet works around it (**written without access to a Wayland machine, 
    owns the shortcuts (Settings > Keyboard > Custom Shortcuts) and runs
    `python main.py --toggle-dictation` etc., which message the running PyKeet.
    On other desktops, `python main.py --shortcut-commands` prints the commands to bind.
-2. Shortcuts are **press to start, press again to stop**. Hold-to-talk and the Esc cancel key
-   are not available on Wayland (Esc cannot be a global shortcut).
+2. Shortcuts are **press to start, press again to stop**. Hold-to-talk is not available on
+   Wayland.
 3. Inserting text: PyKeet cannot press Ctrl+V for you, so it **copies the text and shows a
    notification - press Ctrl+V**. For automatic typing, install `ydotool`, run its daemon, and
    give yourself write access to `/dev/uinput` (udev rule); PyKeet then uses it automatically.
@@ -263,7 +263,7 @@ each time.
 
 **Finishing.** **Copy with highlights and close** puts rich text on the clipboard with flagged
 words highlighted (it pastes straight into an email), plus a plain-text fallback. **Copy plain and
-close** (or Esc) copies the clean text. Copying also closes the window. On Wayland, press Ctrl+V
+close** copies the clean text. Copying also closes the window. On Wayland, press Ctrl+V
 afterwards.
 
 **Voices** (`tts_engine = "auto"` tries Kokoro then Piper; install at least one; models download on first use into

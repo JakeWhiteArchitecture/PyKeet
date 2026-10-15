@@ -8,6 +8,7 @@ placed by the compositor and may not float above everything; on X11 both work.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import re
 import signal
@@ -48,6 +49,28 @@ def qss() -> str:
     QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 6px; min-height: 30px; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
     """
+
+
+def choose_platform(cfg: dict) -> None:
+    """Pick Qt's platform before the QApplication exists. Wayland apps cannot place their window
+    or stay on top, so by default run through XWayland (like the old Tk pill) when it is there."""
+    import ctypes.util
+
+    if os.environ.get("QT_QPA_PLATFORM") or not sys.platform.startswith("linux"):
+        return
+    want = str(cfg.get("qt_platform", "auto")).lower()
+    wayland = (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+               or bool(os.environ.get("WAYLAND_DISPLAY")))
+    if want == "wayland":
+        os.environ["QT_QPA_PLATFORM"] = "wayland"
+    elif want == "xcb" or (want == "auto" and wayland):
+        if os.environ.get("DISPLAY") and ctypes.util.find_library("xcb-cursor"):
+            os.environ["QT_QPA_PLATFORM"] = "xcb"
+            log.info("Qt: using XWayland (xcb) so the pill can be placed and stay on top")
+        else:
+            log.warning("Qt: XWayland not usable (need DISPLAY and xcb-util-cursor: sudo dnf "
+                        "install xcb-util-cursor); using native Wayland, where the desktop "
+                        "decides where windows go")
 
 
 def is_x11() -> bool:
@@ -244,6 +267,7 @@ class QtWidget:
     def __init__(self, app):
         self.app = app
         self.q: queue.Queue = queue.Queue()
+        choose_platform(app.cfg)
         self.qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
         self.qapp.setApplicationName("PyKeet")
         self.qapp.setQuitOnLastWindowClosed(False)
@@ -262,7 +286,8 @@ class QtWidget:
             self.pill.move(int(pos[0]), int(pos[1]))
         elif is_x11():
             geo = self.qapp.primaryScreen().availableGeometry()
-            self.pill.move(geo.center().x() - self.pill.width() // 2, geo.bottom() - 136)
+            self.pill.move(geo.center().x() - self.pill.width() // 2,
+                           geo.bottom() - 90 - self.pill.height())
         self.timer = QTimer()
         self.timer.timeout.connect(self._poll)
         self.timer.start(40)
@@ -448,7 +473,6 @@ class ViewerWindow(QtWidgets.QWidget):
         close.clicked.connect(self.close)
         bar.addWidget(close)
         lay.addLayout(bar)
-        QtGui.QShortcut(QtGui.QKeySequence("Escape"), self, activated=self.close)
 
         self.render()
         self.start_analysis()
@@ -842,8 +866,7 @@ class ProofWindow(QtWidgets.QWidget):
         elif sess.note:
             self.status.setText(sess.note)
         elif sess.finished:
-            self.status.setText(f"Finished reading. {n} flagged. Copy to finish "
-                                f"(Esc = copy plain and close).")
+            self.status.setText(f"Finished reading. {n} flagged. Use a copy button to finish.")
         else:
             state = "Paused" if sess.paused else "Reading"
             extra = f" · {len(self.changes)} changed (hover them)" if self.changes else ""
@@ -1034,8 +1057,6 @@ class ProofWindow(QtWidgets.QWidget):
             self.sess.jump(-1)
         elif k == Qt.Key.Key_Right:
             self.sess.jump(1)
-        elif k == Qt.Key.Key_Escape:
-            self.finish(False)
         else:
             super().keyPressEvent(e)
 
