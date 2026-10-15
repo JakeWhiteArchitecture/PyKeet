@@ -12,6 +12,8 @@ No cloud, no account, no word limits.
 > One assumption to check first: the exact layout of Parakeet's `timestamps="word"` result
 > (`extract_units()` in `main.py` accepts words at top level, words inside segments, or plain segments).
 
+How the parts fit together (with diagrams): [docs/architecture.md](docs/architecture.md).
+
 ## Install
 
 Python 3.10+ (moondream needs 3.10 or newer).
