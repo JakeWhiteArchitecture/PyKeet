@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 import numpy as np
 
-VERSION = "2.5"
+VERSION = "2.6"
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
 LOG_PATH = HERE / "pykeet.log"
@@ -214,6 +214,13 @@ proofread_reaction_seconds = 0.5
 # highlighted flags (rich text, ready to paste into an email). No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
+# ...or this many words (Parakeet sometimes gives a long dictation hardly any full stops, which
+# would count as one sentence).
+review_min_words = 30
+# Which view the window opens in: "auto" = Cleanup if the cleanup changed anything, else
+# Proofread; or "cleanup" / "proofread". Cleanup view: see what was changed, restore it, teach
+# PyKeet. Proofread view: hear it read back and flag mistakes.
+review_start_view = "auto"
 # Also open the window for a short dictation when the cleanup replaced or removed words
 # (not for capitals, punctuation or um/uh), so you can see what changed and restore it.
 review_when_changed = false
@@ -259,6 +266,8 @@ DEFAULTS = {
     "piper_noise_w": 0.9,
     "review_long_dictation": True,
     "review_min_sentences": 3,
+    "review_min_words": 30,
+    "review_start_view": "auto",
     "review_when_changed": False,
     "proofread_phrase_words": 14,
     "proofread_reaction_seconds": 0.5,
@@ -3068,11 +3077,14 @@ class App:
             self.last_text = text
             n_changes = len(compute_changes(raw, text))
             n_sent = count_sentences(text)
+            n_words = len(text.split())
             changed = bool(self.cfg["review_when_changed"]) and n_changes > 0
             opens = bool(self.cfg["review_long_dictation"] and self.widget and (
-                n_sent >= int(self.cfg["review_min_sentences"]) or changed))
-            log.info("dictation: %d sentence(s), %d word change(s) by the cleanup -> read-back "
-                     "window: %s", n_sent, n_changes, "yes" if opens else "no")
+                n_sent >= int(self.cfg["review_min_sentences"])
+                or n_words >= int(self.cfg["review_min_words"]) or changed))
+            log.info("dictation: %d sentence(s), %d word(s), %d word change(s) by the cleanup "
+                     "-> read-back window: %s", n_sent, n_words, n_changes,
+                     "yes" if opens else "no")
             if opens:
                 # long (or edited): show it first; the window pastes/copies when you close it
                 self.review_open = True

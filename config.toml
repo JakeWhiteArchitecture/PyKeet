@@ -159,6 +159,13 @@ proofread_reaction_seconds = 0.5
 # highlighted flags (rich text, ready to paste into an email). No new dictation can start until the window is closed.
 review_long_dictation = true
 review_min_sentences = 3
+# ...or this many words (Parakeet sometimes gives a long dictation hardly any full stops, which
+# would count as one sentence).
+review_min_words = 30
+# Which view the window opens in: "auto" = Cleanup if the cleanup changed anything, else
+# Proofread; or "cleanup" / "proofread". Cleanup view: see what was changed, restore it, teach
+# PyKeet. Proofread view: hear it read back and flag mistakes.
+review_start_view = "auto"
 # Also open the window for a short dictation when the cleanup replaced or removed words
 # (not for capitals, punctuation or um/uh), so you can see what changed and restore it.
 review_when_changed = false

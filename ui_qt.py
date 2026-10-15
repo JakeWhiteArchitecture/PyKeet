@@ -43,6 +43,7 @@ def qss() -> str:
                    border-radius: 9px; padding: 8px 16px; }}
     QPushButton:hover {{ background: {t['purple']}; color: {t['text']}; }}
     QPushButton:pressed {{ background: {t['cyan']}; color: {t['bg']}; }}
+    QPushButton:checked {{ background: {t['purple']}; color: {t['text']}; border-color: {t['cyan']}; }}
     QLabel#muted {{ color: {t['muted']}; }}
     QLabel#status {{ color: {t['text']}; padding: 2px 4px; }}
     QScrollBar:vertical {{ background: {t['card']}; width: 12px; margin: 0; border-radius: 6px; }}
@@ -398,6 +399,16 @@ class QtWidget:
         win.activateWindow()
         win.setFocus()
 
+        def check_visible():  # GNOME may refuse to put a new window in front
+            try:
+                if not win.isActiveWindow() and win.isVisible():
+                    self.app.notify("PyKeet", "Your read-back window is ready (it may be behind "
+                                              "other windows).")
+            except RuntimeError:
+                pass  # already closed
+
+        QTimer.singleShot(800, check_visible)
+
     def pick_file(self) -> None:
         filt = ";;".join(f"{name} ({pat})" if pat != "*.*" else f"{name} (*)"
                          for name, pat in M.AUDIO_TYPES)
@@ -639,6 +650,7 @@ class ProofWindow(QtWidgets.QWidget):
         self.cfg = ui.app.cfg
         self.done = False
         self.edit_mode = False
+        self.reading_started = False
         self.rw = None            # rewind state while Space is held
         self.hover = None         # index into self.changes shown in the bubble
         self.events: queue.Queue = queue.Queue()
@@ -649,9 +661,28 @@ class ProofWindow(QtWidgets.QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.changes = M.compute_changes(self.raw, self.text)
-        self.sess = self.make_session(text, set(), 0, paused=False)
+        want = str(self.cfg.get("review_start_view", "auto")).lower()
+        self.view = want if want in ("cleanup", "proofread") else (
+            "cleanup" if self.changes else "proofread")
+        # Cleanup view does not read aloud; the session waits, paused, until you switch to
+        # Proofread
+        self.sess = self.make_session(text, set(), 0, paused=(self.view == "cleanup"))
+        self.reading_started = self.view == "proofread"
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(14, 14, 14, 12)
+        views = QtWidgets.QHBoxLayout()
+        self.view_cleanup = QtWidgets.QPushButton()
+        self.view_proof = QtWidgets.QPushButton("Proofread: listen and flag errors")
+        group = QtWidgets.QButtonGroup(self)
+        for b in (self.view_cleanup, self.view_proof):
+            b.setCheckable(True)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            group.addButton(b)
+            views.addWidget(b)
+        views.addStretch(1)
+        self.view_cleanup.clicked.connect(lambda: self.set_view("cleanup"))
+        self.view_proof.clicked.connect(lambda: self.set_view("proofread"))
+        lay.addLayout(views)
         self.status = QtWidgets.QLabel("Starting…")
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
@@ -706,6 +737,36 @@ class ProofWindow(QtWidgets.QWidget):
             self.sess.start()
         else:
             QTimer.singleShot(0, lambda: self.finish(False))
+        self.set_view(self.view, first=True)
+
+    def set_view(self, view: str, first: bool = False) -> None:
+        """Cleanup = what the cleanup changed (restore it, teach PyKeet). Proofread = listen
+        and flag errors."""
+        if not first and view == self.view:
+            self.update_view_buttons()
+            return
+        self.commit_edit()
+        self.bubble.hide()
+        self.view = view
+        if view == "proofread":
+            if not self.reading_started:
+                self.reading_started = True
+                self.sess.restart()          # first time: read from the start
+            elif self.sess.paused and not first:
+                self.sess.toggle_pause()
+        elif not first and not self.sess.paused:
+            self.sess.toggle_pause()          # leaving Proofread silences the reading
+        self.update_view_buttons()
+        self.refresh()
+
+    def update_view_buttons(self) -> None:
+        n = len(self.changes)
+        self.view_cleanup.setText(f"Cleanup: {n} change{'s' if n != 1 else ''}")
+        self.view_cleanup.setChecked(self.view == "cleanup")
+        self.view_proof.setChecked(self.view == "proofread")
+        proof = self.view == "proofread"
+        self.rewind.setVisible(proof)
+        self.pause.setVisible(proof)
 
     # -- sessions ------------------------------------------------------------------------
     def make_session(self, text: str, flags: set, pos: int, paused: bool):
@@ -827,14 +888,17 @@ class ProofWindow(QtWidgets.QWidget):
         flag = QtGui.QTextCharFormat()
         flag.setBackground(QtGui.QColor(t["pink"]))
         flag.setUnderlineStyle(QtGui.QTextCharFormat.UnderlineStyle.SingleUnderline)
-        playing = 0 <= sess.cur < len(sess.spans) and not sess.finished
+        proof = self.view == "proofread"
+        playing = proof and 0 <= sess.cur < len(sess.spans) and not sess.finished
         if playing and self.rw is None and not self.edit_mode:
             a, b = sess.spans[sess.cur]
             sels.append(self._selection(a, b, now))
-        for (a, b), _c in self.anchors():  # after the reading highlight, so the colour shows
-            sels.append(self._selection(a, b, chg))
-        for a, b in sess.flags:
-            sels.append(self._selection(a, b, flag))
+        if not proof:
+            for (a, b), _c in self.anchors():
+                sels.append(self._selection(a, b, chg))
+        else:
+            for a, b in sess.flags:
+                sels.append(self._selection(a, b, flag))
         if self.rw is not None:
             cur = QtGui.QTextCharFormat()
             cur.setBackground(QtGui.QColor(t["cyan"]))
@@ -854,12 +918,21 @@ class ProofWindow(QtWidgets.QWidget):
                 self.edit.setTextCursor(c)
                 self.edit.ensureCursorVisible()
         self.pause.setText("Resume" if sess.paused else "Pause")
+        self.update_view_buttons()
         n = len(sess.flags)
         if error:
             self.status.setText(error)
         elif self.edit_mode:
             self.status.setText("Editing: change the text, then press Done editing "
                                 "(Ctrl+Enter). Reading is paused.")
+        elif not proof:
+            k = len(self.changes)
+            self.status.setText(
+                f"{k} change{'s' if k != 1 else ''} from what you said (shown in amber). Hover "
+                f"one to see the original; Restore puts it back. Right-click to teach PyKeet. "
+                f"Switch to Proofread to listen and flag errors." if k else
+                "The cleanup changed no words. Switch to Proofread to listen and flag errors, "
+                "or Edit text to fix something.")
         elif self.rw is not None:
             self.status.setText("Rewinding… let go of SPACE to flag the highlighted word and "
                                 "play again from it")
@@ -875,7 +948,7 @@ class ProofWindow(QtWidgets.QWidget):
 
     # -- hover bubble, restore, right-click ---------------------------------------------------
     def eventFilter(self, obj, ev) -> bool:
-        if obj is self.edit.viewport() and not self.edit_mode:
+        if obj is self.edit.viewport() and not self.edit_mode and self.view == "cleanup":
             if ev.type() == QtCore.QEvent.Type.MouseMove:
                 self.on_hover(ev.position().toPoint())
             elif ev.type() == QtCore.QEvent.Type.Leave:
@@ -931,7 +1004,7 @@ class ProofWindow(QtWidgets.QWidget):
         self.apply_text(new)
 
     def show_menu(self, pt) -> None:
-        if self.edit_mode:
+        if self.edit_mode or self.view != "cleanup":
             return
         c = self.change_at(self.edit.cursorForPosition(pt).position())
         if c is None:
@@ -1046,7 +1119,7 @@ class ProofWindow(QtWidgets.QWidget):
     # -- keys: tap = flag, hold = rewind ------------------------------------------------------
     def keyPressEvent(self, e) -> None:
         k = e.key()
-        if self.edit_mode:
+        if self.edit_mode or self.view != "proofread":
             return super().keyPressEvent(e)
         if k == Qt.Key.Key_Space:
             if not e.isAutoRepeat():
